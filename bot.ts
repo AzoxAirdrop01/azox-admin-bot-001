@@ -3,6 +3,7 @@
 
 import { Bot, InlineKeyboard, session } from "grammy";
 import { createClient } from "@supabase/supabase-js";
+import { randomUUID } from "node:crypto";
 
 // ─── ENV ────────────────────────────────────────────
 const BOT_TOKEN    = process.env.ADMIN_BOT_TOKEN!;
@@ -25,6 +26,13 @@ interface SessionData {
   msgBody?: string;     // ← for announcements
   editTaskId?: string;
   editField?: string;
+  // ── stories ──
+  storyFileId?: string;
+  storyMime?: string;
+  storyKind?: "image" | "video";
+  storyExt?: string;
+  storyLink?: string;
+  storyHours?: number;
 }
 
 // ─── BOT ────────────────────────────────────────────
@@ -103,7 +111,7 @@ function platformKeyboard(prefix: string) {
 bot.command("start", async (ctx) => {
   console.log("[/start] received from:", ctx.from?.id);
   if (isAdmin(ctx)) {
-    await ctx.reply("👋 AZOX Admin Bot\n\nCommands:\n/edit_task — Manage tasks\n/message — Send announcement\n/edit_message — Edit announcements");
+    await ctx.reply("👋 AZOX Admin Bot\n\nCommands:\n/edit_task — Manage tasks\n/message — Send announcement\n/edit_message — Edit announcements\n/share_story — Manage Story\n/edit_story — edit Story");
   } else {
     await ctx.reply("⛔ Access denied.");
   }
@@ -266,11 +274,394 @@ bot.callbackQuery(/^deletemsg_(.+)$/, async (ctx) => {
 });
 
 
+// NOTE: story commands must be registered BEFORE the text handler below,
+// because that handler consumes every text message (commands included).
+// ═══════════════════════════════════════════════════
+// 📖 STORIES — /share_story & /edit_story
+// Media goes to the public Supabase Storage bucket "stories";
+// the row in public.stories is what the Mini App reads.
+// ═══════════════════════════════════════════════════
+
+const STORY_BUCKET = "stories";
+const STORY_MAX_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit
+const STORY_MIN_HOURS = 1;
+const STORY_MAX_HOURS = 120;
+const STORY_MAX_LINK_LENGTH = 2048;
+const STORY_DURATION_PROMPT =
+  `⏱ How many hours should the story stay visible?\n\nTap a button or send a number from ${STORY_MIN_HOURS} to ${STORY_MAX_HOURS}:`;
+
+const STORY_MIMES: Record<string, { kind: "image" | "video"; ext: string }> = {
+  "image/jpeg":      { kind: "image", ext: "jpg" },
+  "image/png":       { kind: "image", ext: "png" },
+  "image/webp":      { kind: "image", ext: "webp" },
+  "video/mp4":       { kind: "video", ext: "mp4" },
+  "video/webm":      { kind: "video", ext: "webm" },
+  "video/quicktime": { kind: "video", ext: "mov" },
+};
+
+// Same rule as requireAdmin, but safe for text commands from non-admins
+// (answerCallbackQuery throws when the update is not a callback query).
+async function denyNonAdmin(ctx: any): Promise<boolean> {
+  if (isAdmin(ctx)) return false;
+  await ctx.reply("⛔ Access denied.").catch(() => {});
+  return true;
+}
+
+function isValidStoryUrl(str: string): boolean {
+  return str.length <= STORY_MAX_LINK_LENGTH && isValidUrl(str);
+}
+
+function parseStoryHours(str: string): number | null {
+  const t = str.trim();
+  if (!/^\d+$/.test(t)) return null;
+  const n = parseInt(t, 10);
+  if (n < STORY_MIN_HOURS || n > STORY_MAX_HOURS) return null;
+  return n;
+}
+
+function storyLinkKeyboard() {
+  return new InlineKeyboard()
+    .text("⏭ Skip (no link)", "sty_skip_link")
+    .text("❌ Cancel", "cancel");
+}
+
+function storyDurationKeyboard() {
+  const kb = new InlineKeyboard();
+  [6, 12, 24, 48, 72, 120].forEach((h, i) => {
+    kb.text(`${h}h`, `sty_dur_${h}`);
+    if (i % 3 === 2) kb.row();
+  });
+  kb.text("❌ Cancel", "cancel");
+  return kb;
+}
+
+function storyPreview(s: SessionData) {
+  const expires = new Date(Date.now() + (s.storyHours ?? 0) * 3600_000);
+  const kb = new InlineKeyboard()
+    .text("✅ Publish story", "sty_confirm")
+    .text("❌ Cancel", "cancel");
+  const text =
+    `📖 Story preview:\n\n` +
+    `Type: ${s.storyKind === "video" ? "🎬 Video" : "🖼 Image"}\n` +
+    `Link: ${s.storyLink ?? "None"}\n` +
+    `Duration: ${s.storyHours}h\n` +
+    `Ends: ${expires.toISOString().replace("T", " ").slice(0, 16)} UTC`;
+  return { text, kb };
+}
+
+function storyTimeLeft(expiresAt: string): string {
+  const ms = new Date(expiresAt).getTime() - Date.now();
+  if (ms <= 0) return "expired";
+  const h = Math.floor(ms / 3600_000);
+  const m = Math.floor((ms % 3600_000) / 60_000);
+  return h > 0 ? `${h}h ${m}m left` : `${m}m left`;
+}
+
+async function downloadTelegramFile(fileId: string): Promise<Buffer> {
+  const file = await bot.api.getFile(fileId);
+  if (!file.file_path) throw new Error("Telegram returned no file path");
+  const res = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
+  if (!res.ok) throw new Error(`Download failed (HTTP ${res.status})`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+// /share_story — step 1: ask for the media
+bot.command("share_story", async (ctx) => {
+  if (await denyNonAdmin(ctx)) return;
+  ctx.session = { step: "story_media" };
+  await ctx.reply(
+    "📖 New Story\n\nSend the photo or video (max 20 MB).\nSupported: JPG, PNG, WEBP, MP4, WEBM, MOV.",
+    { reply_markup: new InlineKeyboard().text("❌ Cancel", "cancel") }
+  );
+});
+
+// step 1 (media received)
+bot.on(["message:photo", "message:video", "message:animation", "message:document"], async (ctx) => {
+  if (!isAdmin(ctx)) return;
+  const s = ctx.session;
+  if (s.step !== "story_media") return;
+
+  const m: any = ctx.message;
+  let fileId: string | undefined;
+  let size: number | undefined;
+  let mime: string | undefined;
+
+  if (m.photo?.length) {
+    const biggest = m.photo[m.photo.length - 1];
+    fileId = biggest.file_id;
+    size = biggest.file_size;
+    mime = "image/jpeg"; // Telegram always re-encodes photos as JPEG
+  } else if (m.video) {
+    fileId = m.video.file_id;
+    size = m.video.file_size;
+    mime = m.video.mime_type ?? "video/mp4";
+  } else if (m.animation) {
+    fileId = m.animation.file_id;
+    size = m.animation.file_size;
+    mime = m.animation.mime_type ?? "video/mp4";
+  } else if (m.document) {
+    fileId = m.document.file_id;
+    size = m.document.file_size;
+    mime = m.document.mime_type;
+  }
+
+  const type = mime ? STORY_MIMES[mime] : undefined;
+  if (!fileId || !type) {
+    return ctx.reply("❌ Unsupported file. Send a JPG, PNG, WEBP, MP4, WEBM or MOV.");
+  }
+  if (size !== undefined && size > STORY_MAX_BYTES) {
+    return ctx.reply("❌ File is larger than 20 MB. Send a smaller one:");
+  }
+
+  s.storyFileId = fileId;
+  s.storyMime = mime;
+  s.storyKind = type.kind;
+  s.storyExt = type.ext;
+  s.step = "story_link";
+  await ctx.reply(
+    `✅ ${type.kind === "video" ? "Video" : "Image"} received.\n\n🔗 Send a link (https://...) that opens when people tap the story, or tap Skip:`,
+    { reply_markup: storyLinkKeyboard() }
+  );
+});
+
+// step 2 (skip link) → step 3
+bot.callbackQuery("sty_skip_link", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const s = ctx.session;
+  if (s.step !== "story_link") {
+    await ctx.editMessageText("❌ Session expired. Use /share_story again.");
+    return ctx.answerCallbackQuery();
+  }
+  s.storyLink = undefined;
+  s.step = "story_duration";
+  await ctx.editMessageText(STORY_DURATION_PROMPT, { reply_markup: storyDurationKeyboard() });
+  await ctx.answerCallbackQuery();
+});
+
+// step 3 (duration preset) → preview
+bot.callbackQuery(/^sty_dur_(\d+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const s = ctx.session;
+  const hours = parseStoryHours(ctx.match[1]);
+  if (s.step !== "story_duration" || hours === null) {
+    await ctx.editMessageText("❌ Session expired. Use /share_story again.");
+    return ctx.answerCallbackQuery();
+  }
+  s.storyHours = hours;
+  s.step = "story_confirm";
+  const p = storyPreview(s);
+  await ctx.editMessageText(p.text, { reply_markup: p.kb });
+  await ctx.answerCallbackQuery();
+});
+
+// step 4: publish (download from Telegram → Storage → row)
+bot.callbackQuery("sty_confirm", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const s = ctx.session;
+  if (
+    s.step !== "story_confirm" || !s.storyFileId || !s.storyMime ||
+    !s.storyKind || !s.storyExt || !s.storyHours
+  ) {
+    await ctx.editMessageText("❌ Session expired. Use /share_story again.");
+    return ctx.answerCallbackQuery();
+  }
+  await ctx.answerCallbackQuery({ text: "Publishing…" });
+
+  let uploadedPath: string | null = null;
+  try {
+    const buf = await downloadTelegramFile(s.storyFileId);
+    if (buf.length > STORY_MAX_BYTES) throw new Error("File is larger than 20 MB");
+
+    const path = `${new Date().toISOString().slice(0, 10)}/${randomUUID()}.${s.storyExt}`;
+    const { error: upErr } = await supabase.storage
+      .from(STORY_BUCKET)
+      .upload(path, buf, { contentType: s.storyMime, upsert: false });
+    if (upErr) throw new Error(upErr.message);
+    uploadedPath = path;
+
+    const publicUrl = supabase.storage.from(STORY_BUCKET).getPublicUrl(path).data.publicUrl;
+    const expiresAt = new Date(Date.now() + s.storyHours * 3600_000).toISOString();
+
+    const { error: insErr } = await supabase.from("stories").insert({
+      media_type:     s.storyKind,
+      media_path:     path,
+      media_url:      publicUrl,
+      link_url:       s.storyLink ?? null,
+      duration_hours: s.storyHours,
+      expires_at:     expiresAt,
+      created_by:     ADMIN_ID,
+    });
+    if (insErr) throw new Error(insErr.message);
+
+    const hours = s.storyHours;
+    const linkLine = s.storyLink ? `\n🔗 ${s.storyLink}` : "";
+    ctx.session = {};
+    await ctx.editMessageText(`✅ Story published for ${hours}h!${linkLine}`);
+  } catch (e: any) {
+    if (uploadedPath) {
+      await supabase.storage.from(STORY_BUCKET).remove([uploadedPath]).catch(() => {});
+    }
+    const p = storyPreview(s);
+    await ctx.editMessageText(`❌ Could not publish: ${e?.message ?? e}\n\n${p.text}`, { reply_markup: p.kb });
+  }
+});
+
+// /edit_story — list the latest stories
+bot.command("edit_story", async (ctx) => {
+  if (await denyNonAdmin(ctx)) return;
+  ctx.session = {};
+  const { data: stories, error } = await supabase
+    .from("stories")
+    .select("id, media_type, link_url, created_at, expires_at")
+    .order("created_at", { ascending: false })
+    .limit(10);
+
+  if (error) return ctx.reply("❌ Error: " + error.message);
+  if (!stories || stories.length === 0) {
+    return ctx.reply("📖 No stories yet. Use /share_story to publish one.");
+  }
+
+  const kb = new InlineKeyboard();
+  stories.forEach((st: any) => {
+    const active = new Date(st.expires_at).getTime() > Date.now();
+    const kind = st.media_type === "video" ? "🎬" : "🖼";
+    const link = st.link_url ? " 🔗" : "";
+    kb.text(`${active ? "🟢" : "⚪️"} ${kind} ${storyTimeLeft(st.expires_at)}${link}`, `sty_pick_${st.id}`).row();
+  });
+  kb.text("❌ Cancel", "cancel");
+  await ctx.reply("✏️ Edit Story — choose:", { reply_markup: kb });
+});
+
+// pick one story
+bot.callbackQuery(/^sty_pick_(.+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const id = ctx.match[1];
+  const { data: st } = await supabase.from("stories").select("*").eq("id", id).single();
+  if (!st) {
+    await ctx.editMessageText("❌ Story not found.");
+    return ctx.answerCallbackQuery();
+  }
+  ctx.session = {};
+  const kb = new InlineKeyboard().text("✏️ Edit link", `sty_link_${id}`).row();
+  if (st.link_url) kb.text("❌ Remove link", `sty_unlink_${id}`).row();
+  kb.text("🗑 Delete story", `sty_del_${id}`).row().text("❌ Cancel", "cancel");
+
+  await ctx.editMessageText(
+    `📖 Story\n\n` +
+    `Type: ${st.media_type === "video" ? "🎬 Video" : "🖼 Image"}\n` +
+    `Link: ${st.link_url ?? "None"}\n` +
+    `Duration: ${st.duration_hours}h\n` +
+    `Status: ${storyTimeLeft(st.expires_at)}`,
+    { reply_markup: kb }
+  );
+  await ctx.answerCallbackQuery();
+});
+
+// edit link
+bot.callbackQuery(/^sty_link_(.+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  ctx.session = { step: "story_edit_link", editTaskId: ctx.match[1] };
+  await ctx.editMessageText(
+    "🔗 Send the new link (https://...):",
+    { reply_markup: new InlineKeyboard().text("❌ Cancel", "cancel") }
+  );
+  await ctx.answerCallbackQuery();
+});
+
+// remove link
+bot.callbackQuery(/^sty_unlink_(.+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const { error } = await supabase
+    .from("stories")
+    .update({ link_url: null })
+    .eq("id", ctx.match[1]);
+  ctx.session = {};
+  await ctx.editMessageText(error ? `❌ Error: ${error.message}` : "✅ Link removed from the story.");
+  await ctx.answerCallbackQuery();
+});
+
+// delete (asks first)
+bot.callbackQuery(/^sty_del_(.+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const id = ctx.match[1];
+  const kb = new InlineKeyboard()
+    .text("🗑 YES — Delete story", `sty_delyes_${id}`).row()
+    .text("❌ Cancel", "cancel");
+  await ctx.editMessageText(
+    "⚠️ Delete this story?\n\nThe media, views, likes and comments will be removed. This CANNOT be undone.",
+    { reply_markup: kb }
+  );
+  await ctx.answerCallbackQuery();
+});
+
+bot.callbackQuery(/^sty_delyes_(.+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const id = ctx.match[1];
+  const { data: st } = await supabase.from("stories").select("media_path").eq("id", id).single();
+  if (!st) {
+    await ctx.editMessageText("❌ Story not found.");
+    return ctx.answerCallbackQuery();
+  }
+  // Row first (cascades views/likes/comments); then the file.
+  const { error } = await supabase.from("stories").delete().eq("id", id);
+  ctx.session = {};
+  if (error) {
+    await ctx.editMessageText(`❌ Error: ${error.message}`);
+  } else {
+    await supabase.storage.from(STORY_BUCKET).remove([st.media_path]).catch(() => {});
+    await ctx.editMessageText("✅ Story deleted.");
+  }
+  await ctx.answerCallbackQuery();
+});
+
+
 // ─── TEXT HANDLER (all steps) ───────────────────────
 bot.on("message:text", async (ctx) => {
   if (!isAdmin(ctx)) return;
   const s = ctx.session;
   const text = ctx.message.text.trim();
+
+  // STORY: link (optional)
+  if (s.step === "story_link") {
+    if (!isValidStoryUrl(text)) {
+      return ctx.reply(
+        "❌ Invalid URL. Must start with https:// or http://\nSend it again, or tap Skip:",
+        { reply_markup: storyLinkKeyboard() }
+      );
+    }
+    s.storyLink = text;
+    s.step = "story_duration";
+    return ctx.reply(STORY_DURATION_PROMPT, { reply_markup: storyDurationKeyboard() });
+  }
+
+  // STORY: duration typed by hand
+  if (s.step === "story_duration") {
+    const hours = parseStoryHours(text);
+    if (hours === null) {
+      return ctx.reply(
+        `❌ Invalid. Send a whole number from ${STORY_MIN_HOURS} to ${STORY_MAX_HOURS}:`,
+        { reply_markup: storyDurationKeyboard() }
+      );
+    }
+    s.storyHours = hours;
+    s.step = "story_confirm";
+    const p = storyPreview(s);
+    return ctx.reply(p.text, { reply_markup: p.kb });
+  }
+
+  // STORY EDIT: new link
+  if (s.step === "story_edit_link" && s.editTaskId) {
+    if (!isValidStoryUrl(text)) {
+      return ctx.reply("❌ Invalid URL. Must start with https:// or http://\nTry again:");
+    }
+    const { error } = await supabase
+      .from("stories")
+      .update({ link_url: text })
+      .eq("id", s.editTaskId);
+    ctx.session = {};
+    if (error) return ctx.reply("❌ Error: " + error.message);
+    return ctx.reply("✅ Story link updated!");
+  }
 
   // ADD: title
   if (s.step === "add_title") {
