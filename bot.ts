@@ -35,13 +35,21 @@ interface SessionData {
   storyHours?: number;
   // ── privacy (private stories / private messages) ──
   storyPrivate?: boolean;
-  privKind?: "story" | "message";
+  privKind?: "story" | "message" | "chatmsg";
   privRecipients?: number[];
   privLabels?: Record<string, string>;
   privNotes?: string;
   rcpKind?: "story" | "message";
   rcpId?: string;
   rcpMode?: "set" | "add";
+  // ── chat messages (the bot writes into users' chats) ──
+  cmKind?: "text" | "photo" | "video" | "animation";
+  cmFileId?: string;
+  cmText?: string;
+  cmEntities?: any[];
+  cmButtons?: { text: string; url: string }[];
+  cmPrivate?: boolean;
+  cmEditId?: string;
 }
 
 // ─── BOT ────────────────────────────────────────────
@@ -120,7 +128,7 @@ function platformKeyboard(prefix: string) {
 bot.command("start", async (ctx) => {
   console.log("[/start] received from:", ctx.from?.id);
   if (isAdmin(ctx)) {
-    await ctx.reply("👋 AZOX Admin Bot\n\nCommands:\n/edit_task — Manage tasks\n/message — Send announcement\n/edit_message — Edit announcements\n/share_story — Manage Story\n/edit_story — edit Story\n/story_privacy — Story Privacy\n/edit_story_privacy — Story Privacy\n/massage_privacy — Massage Privacy\n/edit_massage_privacy — Massage Privacy");
+    await ctx.reply("👋 AZOX Admin Bot\n\nCommands:\n/edit_task — Manage tasks\n/message — Send announcement\n/edit_message — Edit announcements\n/share_story — Manage Story\n/edit_story — edit Story\n/story_privacy — Story Privacy\n/edit_story_privacy — Story Privacy\n/massage_privacy — Massage Privacy\n/edit_massage_privacy — Massage Privacy\n/chat_massage — Chat Massage\n/edit_chat_massage — Edit Chat Massage\n/chat_massage_privacy — Chat Massage Privacy\n/edit_chat_massage_privacy — Edit Chat Massage Privacy");
   } else {
     await ctx.reply("⛔ Access denied.");
   }
@@ -391,6 +399,7 @@ bot.command("share_story", async (ctx) => {
 bot.on(["message:photo", "message:video", "message:animation", "message:document"], async (ctx) => {
   if (!isAdmin(ctx)) return;
   const s = ctx.session;
+  if (s.step === "cm_content") return handleChatMediaContent(ctx, s);
   if (s.step !== "story_media") return;
 
   const m: any = ctx.message;
@@ -874,6 +883,7 @@ async function handlePrivateRecipientsText(ctx: any, s: SessionData, text: strin
 
   if (s.step === "priv_to") {
     s.step = "priv_confirm";
+    if (s.privKind === "chatmsg") return sendCmConfirm(ctx, s);
     const p = s.privKind === "story" ? privateStoryPreview(s) : privateMessagePreview(s);
     return ctx.reply(p.text, { reply_markup: p.kb });
   }
@@ -1122,6 +1132,641 @@ bot.callbackQuery("prcp_apply", async (ctx) => {
   await ctx.answerCallbackQuery();
 });
 
+// ═══════════════════════════════════════════════════
+// 💬 CHAT MESSAGES — messages the BOT itself sends into users' Telegram chats
+// /chat_massage, /edit_chat_massage, /chat_massage_privacy, /edit_chat_massage_privacy
+// Content = text OR photo/video/GIF (+caption), with formatting + links replayed exactly
+// as typed, and optional URL buttons. Every delivery is stored so it can be edited,
+// deleted, resumed after a restart, or extended to more accounts.
+// ═══════════════════════════════════════════════════
+
+type CmButton = { text: string; url: string };
+type CmKind = "text" | "photo" | "video" | "animation";
+type CmRow = {
+  kind: CmKind;
+  media_file_id: string | null;
+  body: string | null;
+  entities: any[];
+  buttons: CmButton[];
+};
+
+const CM_MAX_TEXT = 4096;
+const CM_MAX_CAPTION = 1024;
+const CM_MAX_BUTTONS = 4;
+const CM_LABEL_MAX = 40;
+const MINI_APP_LINK = process.env.MINI_APP_LINK ?? "https://t.me/AZOX_Airdrop_bot/AZOX_Airdrop";
+// Telegram allows ~30 messages/second for a bot; 50 ms between sends = 20/s with headroom.
+const CM_SEND_DELAY_MS = Number(process.env.CHAT_SEND_DELAY_MS ?? 50);
+const CM_ALLOWED_ENTITIES = new Set([
+  "bold", "italic", "underline", "strikethrough", "spoiler", "code", "pre", "text_link", "url",
+  "blockquote", "expandable_blockquote", "mention", "hashtag", "cashtag", "bot_command", "email", "phone_number",
+]);
+
+const CM_CONTENT_PROMPT =
+  "Send the message now:\n" +
+  "• Text (format it and add links as you like), or\n" +
+  "• a Photo / Video / GIF with an optional caption.\n\n" +
+  `Limits: text ${CM_MAX_TEXT} characters, caption ${CM_MAX_CAPTION}.`;
+const CM_BUTTONS_PROMPT =
+  "🔗 Buttons (optional)\n\n" +
+  `Send up to ${CM_MAX_BUTTONS} buttons, one per line:\nLabel | https://link\n\n` +
+  "To open the Mini App use:\nOpen App | app\n\nOr tap Skip.";
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const nowIso = () => new Date().toISOString();
+
+function cleanEntities(entities: any[] | undefined): any[] {
+  return (entities ?? []).filter((e) => e && CM_ALLOWED_ENTITIES.has(e.type));
+}
+
+function parseButtons(raw: string): { buttons: CmButton[]; errors: string[] } {
+  const buttons: CmButton[] = [];
+  const errors: string[] = [];
+  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length > CM_MAX_BUTTONS) errors.push(`Maximum ${CM_MAX_BUTTONS} buttons.`);
+  for (const line of lines.slice(0, CM_MAX_BUTTONS)) {
+    const i = line.indexOf("|");
+    if (i < 1) { errors.push(`"${line.slice(0, 40)}" → use: Label | https://link`); continue; }
+    const label = line.slice(0, i).trim();
+    let target = line.slice(i + 1).trim();
+    if (target.toLowerCase() === "app") target = MINI_APP_LINK;
+    if (!label || label.length > CM_LABEL_MAX) { errors.push(`"${label.slice(0, 20)}" → label must be 1–${CM_LABEL_MAX} characters`); continue; }
+    if (!/^https:\/\/\S+$/i.test(target) || target.length > 2048) { errors.push(`"${label}" → the link must start with https://`); continue; }
+    buttons.push({ text: label, url: target });
+  }
+  return { buttons, errors };
+}
+
+function cmMarkup(buttons: CmButton[] | null | undefined): any {
+  if (!buttons?.length) return undefined;
+  return { inline_keyboard: buttons.map((b) => [{ text: b.text, url: b.url }]) };
+}
+
+function tgErr(e: any) {
+  return {
+    code: e?.error_code as number | undefined,
+    desc: String(e?.description ?? e?.message ?? e).slice(0, 200),
+    retry: e?.parameters?.retry_after as number | undefined,
+  };
+}
+
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e: any) {
+      const t = tgErr(e);
+      if (attempt < 3 && (t.code === 429 || e?.name === "HttpError")) {
+        await sleep((t.retry ?? 1) * 1000 + (t.retry ? 250 : 0));
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
+function sendCampaignMessage(chatId: number, row: CmRow): Promise<any> {
+  const reply_markup = cmMarkup(row.buttons);
+  const entities = row.entities?.length ? row.entities : undefined;
+  if (row.kind === "text") {
+    return bot.api.sendMessage(chatId, row.body ?? "", { entities, reply_markup } as any);
+  }
+  const opts: any = { caption: row.body || undefined, caption_entities: entities, reply_markup };
+  if (row.kind === "photo") return bot.api.sendPhoto(chatId, row.media_file_id!, opts);
+  if (row.kind === "video") return bot.api.sendVideo(chatId, row.media_file_id!, opts);
+  return bot.api.sendAnimation(chatId, row.media_file_id!, opts);
+}
+
+function sessionRow(s: SessionData): CmRow {
+  return {
+    kind: s.cmKind!,
+    media_file_id: s.cmFileId ?? null,
+    body: s.cmText ?? null,
+    entities: s.cmEntities ?? [],
+    buttons: s.cmButtons ?? [],
+  };
+}
+
+async function allUserIds(): Promise<number[]> {
+  const ids: number[] = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabase
+      .from("users")
+      .select("telegram_id")
+      .gt("telegram_id", 0)
+      .order("telegram_id", { ascending: true })
+      .range(from, from + 999);
+    if (error) throw new Error(error.message);
+    (data ?? []).forEach((u: any) => ids.push(Number(u.telegram_id)));
+    if (!data || data.length < 1000) break;
+  }
+  return ids;
+}
+
+// One heavy job at a time (keeps the whole bot under Telegram's global rate limit).
+let cmQueue: Promise<void> = Promise.resolve();
+function enqueueCm(task: () => Promise<void>): Promise<void> {
+  cmQueue = cmQueue.then(task).catch((e) => console.error("[chat-message job]", e));
+  return cmQueue;
+}
+
+async function safeNotify(chatId: number, text: string, edit?: number) {
+  try {
+    if (edit) await bot.api.editMessageText(chatId, edit, text);
+    else await bot.api.sendMessage(chatId, text);
+  } catch { /* progress/notice only */ }
+}
+
+type Notify = { chatId: number; messageId?: number };
+
+async function countStatus(id: string, status: string): Promise<number> {
+  const { count } = await supabase
+    .from("chat_message_deliveries")
+    .select("telegram_id", { count: "exact", head: true })
+    .eq("chat_message_id", id)
+    .eq("status", status);
+  return count ?? 0;
+}
+
+// Sends every PENDING delivery of a campaign (also used to resume after a restart).
+async function runSendCampaign(id: string, notify?: Notify): Promise<void> {
+  const { data: row } = await supabase.from("chat_messages").select("*").eq("id", id).single();
+  if (!row || row.status !== "sending") return;
+  const seen = new Set<number>(); // never retry a user in this run, even if the DB write fails
+  let done = 0;
+  let lastEdit = 0;
+  const total = Number(row.total_count) || 0;
+
+  for (;;) {
+    const { data: batch } = await supabase
+      .from("chat_message_deliveries")
+      .select("telegram_id")
+      .eq("chat_message_id", id)
+      .eq("status", "pending")
+      .order("telegram_id", { ascending: true })
+      .limit(50);
+    const fresh = (batch ?? []).filter((d: any) => !seen.has(Number(d.telegram_id)));
+    if (!fresh.length) break;
+    for (const d of fresh) {
+      const uid = Number(d.telegram_id);
+      seen.add(uid);
+      let upd: Record<string, unknown>;
+      try {
+        const msg = await withRetry(() => sendCampaignMessage(uid, row as CmRow));
+        upd = { status: "sent", message_id: msg.message_id, error: null };
+      } catch (e) {
+        const t = tgErr(e);
+        upd = { status: t.code === 403 ? "blocked" : "failed", error: t.desc };
+      }
+      const { error: uErr } = await supabase
+        .from("chat_message_deliveries")
+        .update({ ...upd, updated_at: nowIso() })
+        .eq("chat_message_id", id)
+        .eq("telegram_id", uid);
+      if (uErr) console.error("[chat-message] could not record delivery", uid, uErr.message);
+      done++;
+      if (notify?.messageId && Date.now() - lastEdit > 4000) {
+        lastEdit = Date.now();
+        await safeNotify(notify.chatId, `📤 Sending… ${done}/${total}`, notify.messageId);
+      }
+      await sleep(CM_SEND_DELAY_MS);
+    }
+  }
+
+  const sent = await countStatus(id, "sent");
+  const blocked = await countStatus(id, "blocked");
+  const failed = await countStatus(id, "failed");
+  await supabase
+    .from("chat_messages")
+    .update({ status: "sent", sent_count: sent, blocked_count: blocked, failed_count: failed })
+    .eq("id", id);
+  if (notify) {
+    const text =
+      `✅ Chat message delivered\n\n📨 Sent: ${sent}\n🚫 Not reachable: ${blocked}` +
+      `\n⚠️ Failed: ${failed}\n👥 Total: ${total}\n\n` +
+      "ℹ️ \"Not reachable\" = the user never started the bot or blocked it.";
+    if (notify.messageId) await safeNotify(notify.chatId, `📤 Done ${total}/${total}`, notify.messageId);
+    await safeNotify(notify.chatId, text);
+  }
+}
+
+async function resumeCampaigns(): Promise<void> {
+  const { data } = await supabase.from("chat_messages").select("id").eq("status", "sending");
+  for (const c of data ?? []) {
+    console.log("[chat-message] resuming campaign", c.id);
+    void enqueueCm(() => runSendCampaign(c.id));
+  }
+}
+
+function applyEdit(mode: "text" | "buttons" | "delete", chatId: number, messageId: number, row: any): Promise<any> {
+  if (mode === "delete") return bot.api.deleteMessage(chatId, messageId);
+  const reply_markup = cmMarkup(row.buttons) ?? { inline_keyboard: [] };
+  const entities = row.entities?.length ? row.entities : undefined;
+  if (mode === "buttons") return bot.api.editMessageReplyMarkup(chatId, messageId, { reply_markup } as any);
+  if (row.kind === "text") return bot.api.editMessageText(chatId, messageId, row.body ?? "", { entities, reply_markup } as any);
+  return bot.api.editMessageCaption(chatId, messageId, { caption: row.body ?? "", caption_entities: entities, reply_markup } as any);
+}
+
+// Edits / deletes the message in every chat where it was delivered.
+async function runEditCampaign(id: string, mode: "text" | "buttons" | "delete", notify?: Notify): Promise<void> {
+  const { data: row } = await supabase.from("chat_messages").select("*").eq("id", id).single();
+  if (!row) return;
+  let ok = 0;
+  let failed = 0;
+  let last = 0;
+  for (;;) {
+    const { data: page } = await supabase
+      .from("chat_message_deliveries")
+      .select("telegram_id, message_id")
+      .eq("chat_message_id", id)
+      .eq("status", "sent")
+      .gt("telegram_id", last)
+      .order("telegram_id", { ascending: true })
+      .limit(100);
+    if (!page?.length) break;
+    for (const d of page) {
+      const uid = Number(d.telegram_id);
+      last = uid;
+      try {
+        await withRetry(() => applyEdit(mode, uid, Number(d.message_id), row));
+        ok++;
+        if (mode === "delete") {
+          await supabase.from("chat_message_deliveries").update({ status: "deleted", updated_at: nowIso() })
+            .eq("chat_message_id", id).eq("telegram_id", uid);
+        }
+      } catch (e) {
+        if (/message is not modified/i.test(tgErr(e).desc)) ok++;
+        else failed++;
+      }
+      await sleep(CM_SEND_DELAY_MS);
+    }
+  }
+  if (mode === "delete") await supabase.from("chat_messages").update({ status: "deleted", deleted_at: nowIso() }).eq("id", id);
+  if (notify) {
+    const label = mode === "delete" ? "deleted" : "updated";
+    await safeNotify(
+      notify.chatId,
+      `✅ Chat message ${label} in ${ok} chat(s)` + (failed ? `\n⚠️ ${failed} could not be ${label}` + (mode === "delete" ? " (Telegram only allows deleting messages younger than 48 hours)" : "") : "")
+    );
+  }
+}
+
+async function createCampaign(s: SessionData, isPrivate: boolean, recipients: number[]): Promise<{ id: string; total: number }> {
+  const { data: row, error } = await supabase
+    .from("chat_messages")
+    .insert({
+      kind: s.cmKind,
+      media_file_id: s.cmFileId ?? null,
+      body: s.cmText ?? null,
+      entities: s.cmEntities ?? [],
+      buttons: s.cmButtons ?? [],
+      is_private: isPrivate,
+      status: "sending",
+      created_by: ADMIN_ID,
+      total_count: recipients.length,
+    })
+    .select("id")
+    .single();
+  if (error || !row) throw new Error(error?.message ?? "could not create the message");
+  for (let i = 0; i < recipients.length; i += 500) {
+    const chunk = recipients.slice(i, i + 500).map((uid) => ({ chat_message_id: row.id, telegram_id: uid }));
+    const { error: dErr } = await supabase.from("chat_message_deliveries").insert(chunk);
+    if (dErr) {
+      await supabase.from("chat_messages").delete().eq("id", row.id);
+      throw new Error(dErr.message);
+    }
+  }
+  return { id: row.id as string, total: recipients.length };
+}
+
+// ── composing a new chat message ───────────────────
+async function startChatCompose(ctx: any, isPrivate: boolean) {
+  if (await denyNonAdmin(ctx)) return;
+  ctx.session = { step: "cm_content", cmPrivate: isPrivate };
+  await ctx.reply(
+    (isPrivate ? "🔒 New Private Chat Message (only the accounts you choose)\n\n" : "💬 New Chat Message (to ALL users)\n\n") + CM_CONTENT_PROMPT,
+    { reply_markup: cancelOnlyKeyboard() }
+  );
+}
+bot.command(["chat_massage", "chat_message"], (ctx) => startChatCompose(ctx, false));
+bot.command(["chat_massage_privacy", "chat_message_privacy"], (ctx) => startChatCompose(ctx, true));
+
+async function askButtons(ctx: any, s: SessionData) {
+  s.step = "cm_buttons";
+  const kb = new InlineKeyboard().text("⏭ Skip (no buttons)", "cm_skip_buttons").row().text("❌ Cancel", "cancel");
+  await ctx.reply(CM_BUTTONS_PROMPT, { reply_markup: kb });
+}
+
+async function handleChatTextContent(ctx: any, s: SessionData) {
+  const raw: string = ctx.message.text; // raw (not trimmed): entity offsets must stay valid
+  if (raw.length > CM_MAX_TEXT) {
+    return ctx.reply(`❌ Too long (${raw.length}/${CM_MAX_TEXT}). Send a shorter text:`, { reply_markup: cancelOnlyKeyboard() });
+  }
+  s.cmKind = "text";
+  s.cmText = raw;
+  s.cmEntities = cleanEntities(ctx.message.entities);
+  s.cmFileId = undefined;
+  return askButtons(ctx, s);
+}
+
+async function handleChatMediaContent(ctx: any, s: SessionData) {
+  const m: any = ctx.message;
+  let kind: CmKind | null = null;
+  let fileId: string | undefined;
+  if (m.photo?.length) { kind = "photo"; fileId = m.photo[m.photo.length - 1].file_id; }
+  else if (m.video) { kind = "video"; fileId = m.video.file_id; }
+  else if (m.animation) { kind = "animation"; fileId = m.animation.file_id; }
+  if (!kind || !fileId) {
+    return ctx.reply("❌ Send a photo, a video, a GIF, or plain text.", { reply_markup: cancelOnlyKeyboard() });
+  }
+  const caption: string = m.caption ?? "";
+  if (caption.length > CM_MAX_CAPTION) {
+    return ctx.reply(`❌ Caption too long (${caption.length}/${CM_MAX_CAPTION}). Send it again with a shorter caption:`, { reply_markup: cancelOnlyKeyboard() });
+  }
+  s.cmKind = kind;
+  s.cmFileId = fileId;
+  s.cmText = caption || undefined;
+  s.cmEntities = cleanEntities(m.caption_entities);
+  return askButtons(ctx, s);
+}
+
+async function afterButtons(ctx: any, s: SessionData) {
+  if (s.cmPrivate) {
+    s.step = "priv_to";
+    s.privKind = "chatmsg";
+    return ctx.reply(PRIV_PROMPT, { reply_markup: cancelOnlyKeyboard() });
+  }
+  return sendCmConfirm(ctx, s);
+}
+
+async function handleChatButtonsText(ctx: any, s: SessionData) {
+  const { buttons, errors } = parseButtons(ctx.message.text);
+  if (errors.length) {
+    return ctx.reply("❌ " + errors.join("\n❌ ") + "\n\nSend the buttons again, or tap Skip:", {
+      reply_markup: new InlineKeyboard().text("⏭ Skip (no buttons)", "cm_skip_buttons").row().text("❌ Cancel", "cancel"),
+    });
+  }
+  s.cmButtons = buttons;
+  return afterButtons(ctx, s);
+}
+
+bot.callbackQuery("cm_skip_buttons", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const s = ctx.session;
+  if (s.step !== "cm_buttons") {
+    await ctx.editMessageText("❌ Session expired. Start again.");
+    return ctx.answerCallbackQuery();
+  }
+  s.cmButtons = [];
+  await ctx.answerCallbackQuery();
+  await afterButtons(ctx, s);
+});
+
+// The preview IS the real message, sent to the admin exactly as users will receive it.
+async function sendCmConfirm(ctx: any, s: SessionData) {
+  const isPrivate = !!s.cmPrivate;
+  try {
+    await sendCampaignMessage(ctx.chat.id, sessionRow(s));
+  } catch (e) {
+    const t = tgErr(e);
+    s.step = "cm_content";
+    s.cmKind = undefined; s.cmText = undefined; s.cmFileId = undefined; s.cmEntities = undefined; s.cmButtons = undefined;
+    return ctx.reply(`❌ Telegram rejected this message: ${t.desc}\n\nSend the message again:`, { reply_markup: cancelOnlyKeyboard() });
+  }
+  let n: number;
+  try {
+    n = isPrivate ? (s.privRecipients ?? []).length : (await allUserIds()).length;
+  } catch (e: any) {
+    return ctx.reply("❌ Could not read the users: " + e.message);
+  }
+  if (!n) return ctx.reply("❌ There are no users to send to.");
+  s.step = isPrivate ? "priv_confirm" : "cm_confirm";
+  const kb = new InlineKeyboard().text(`✅ Send to ${n} account${n === 1 ? "" : "s"}`, "cm_send").row();
+  if (isPrivate) kb.text("✏️ Change recipients", "priv_change").row();
+  kb.text("❌ Cancel", "cancel");
+  await ctx.reply(
+    "👆 This is exactly what " + (isPrivate ? "the chosen accounts" : "every user") + " will receive." +
+      (isPrivate ? "\n\n" + recipientsBlock(s.privRecipients ?? [], s.privLabels ?? {}) + (s.privNotes ?? "") : `\n\n👥 ${n} users`) +
+      "\n\nℹ️ Only users who started the bot can receive it; the rest are reported as not reachable.",
+    { reply_markup: kb }
+  );
+}
+
+bot.callbackQuery("cm_send", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const s = ctx.session;
+  const isPrivate = !!s.cmPrivate;
+  const okStep = isPrivate ? "priv_confirm" : "cm_confirm";
+  if (s.step !== okStep || !s.cmKind || (isPrivate && (s.privKind !== "chatmsg" || !s.privRecipients?.length))) {
+    await ctx.editMessageText("❌ Session expired. Start again.");
+    return ctx.answerCallbackQuery();
+  }
+  let recipients: number[];
+  try {
+    recipients = isPrivate ? s.privRecipients! : await allUserIds();
+  } catch (e: any) {
+    await ctx.editMessageText("❌ Could not read the users: " + e.message);
+    return ctx.answerCallbackQuery();
+  }
+  if (!recipients.length) {
+    await ctx.editMessageText("❌ There are no users to send to.");
+    return ctx.answerCallbackQuery();
+  }
+  let created: { id: string; total: number };
+  try {
+    created = await createCampaign(s, isPrivate, recipients);
+  } catch (e: any) {
+    await ctx.editMessageText("❌ Could not start: " + e.message);
+    return ctx.answerCallbackQuery();
+  }
+  const chatId = ctx.chat!.id;
+  const mid = ctx.callbackQuery.message?.message_id;
+  ctx.session = {};
+  await ctx.editMessageText(`📤 Sending to ${created.total} account${created.total === 1 ? "" : "s"}…`);
+  await ctx.answerCallbackQuery({ text: "Sending…" });
+  void enqueueCm(() => runSendCampaign(created.id, { chatId, messageId: mid }));
+});
+
+// ── editing sent chat messages ─────────────────────
+async function listCampaigns(ctx: any, isPrivate: boolean) {
+  if (await denyNonAdmin(ctx)) return;
+  ctx.session = {};
+  const { data: rows, error } = await supabase
+    .from("chat_messages")
+    .select("id, kind, body, created_at, status, total_count, sent_count")
+    .eq("is_private", isPrivate)
+    .neq("status", "deleted")
+    .order("created_at", { ascending: false })
+    .limit(10);
+  if (error) return ctx.reply("❌ Error: " + error.message);
+  if (!rows || rows.length === 0) {
+    return ctx.reply(isPrivate ? "🔒 No private chat messages yet. Use /chat_massage_privacy." : "💬 No chat messages yet. Use /chat_massage.");
+  }
+  const icon: Record<string, string> = { text: "💬", photo: "🖼", video: "🎬", animation: "🎞" };
+  const kb = new InlineKeyboard();
+  rows.forEach((r: any) => {
+    const date = new Date(r.created_at).toLocaleDateString("en-GB");
+    const label = String(r.body ?? `(${r.kind})`).replace(/\s+/g, " ").slice(0, 18);
+    kb.text(`${icon[r.kind] ?? "💬"} ${date} — ${label} (${r.sent_count}/${r.total_count})`, `cmpick_${r.id}`).row();
+  });
+  kb.text("❌ Cancel", "cancel");
+  await ctx.reply(isPrivate ? "✏️ Edit Private Chat Message — choose:" : "✏️ Edit Chat Message — choose:", { reply_markup: kb });
+}
+bot.command(["edit_chat_massage", "edit_chat_message"], (ctx) => listCampaigns(ctx, false));
+bot.command(["edit_chat_massage_privacy", "edit_chat_message_privacy"], (ctx) => listCampaigns(ctx, true));
+
+bot.callbackQuery(/^cmpick_(.+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const id = ctx.match[1]!;
+  const { data: r } = await supabase.from("chat_messages").select("*").eq("id", id).single();
+  if (!r || r.status === "deleted") {
+    await ctx.editMessageText("❌ Not found.");
+    return ctx.answerCallbackQuery();
+  }
+  ctx.session = {};
+  const btns = (r.buttons ?? []).map((b: CmButton) => `• ${b.text} → ${b.url}`).join("\n") || "None";
+  const kb = new InlineKeyboard()
+    .text("✏️ Edit text", `cmedtext_${id}`).row()
+    .text("🔗 Edit buttons", `cmedbtn_${id}`).row();
+  if (r.is_private) kb.text("➕ Send to more accounts", `cmmore_${id}`).row();
+  kb.text("🗑 Delete for everyone", `cmdel_${id}`).row().text("❌ Cancel", "cancel");
+  await ctx.editMessageText(
+    `${r.is_private ? "🔒" : "💬"} Chat message (${r.kind})\n\n${String(r.body ?? "(no text)").slice(0, 300)}\n\n` +
+      `Buttons:\n${btns}\n\n📨 ${r.sent_count}/${r.total_count} delivered · 🚫 ${r.blocked_count} not reachable · ⚠️ ${r.failed_count} failed` +
+      (r.status === "sending" ? "\n⏳ Still sending…" : ""),
+    { reply_markup: kb }
+  );
+  await ctx.answerCallbackQuery();
+});
+
+bot.callbackQuery(/^cmedtext_(.+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  ctx.session = { step: "cm_edit_text", cmEditId: ctx.match[1]! };
+  await ctx.editMessageText("✏️ Send the new text (or caption). It replaces the old one in every chat.\nFormatting and links are kept.", { reply_markup: cancelOnlyKeyboard() });
+  await ctx.answerCallbackQuery();
+});
+bot.callbackQuery(/^cmedbtn_(.+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  ctx.session = { step: "cm_edit_buttons", cmEditId: ctx.match[1]! };
+  await ctx.editMessageText("🔗 Send the new buttons, one per line:\nLabel | https://link\n(Open the Mini App with: Open App | app)\n\nSend none to remove all buttons.", { reply_markup: cancelOnlyKeyboard() });
+  await ctx.answerCallbackQuery();
+});
+
+async function handleChatEditText(ctx: any, s: SessionData) {
+  const id = s.cmEditId!;
+  const raw: string = ctx.message.text;
+  const { data: r } = await supabase.from("chat_messages").select("kind, status").eq("id", id).single();
+  if (!r || r.status === "deleted") { ctx.session = {}; return ctx.reply("❌ Not found."); }
+  const max = r.kind === "text" ? CM_MAX_TEXT : CM_MAX_CAPTION;
+  if (raw.length > max) return ctx.reply(`❌ Too long (${raw.length}/${max}). Send a shorter text:`, { reply_markup: cancelOnlyKeyboard() });
+  const { error } = await supabase.from("chat_messages").update({ body: raw, entities: cleanEntities(ctx.message.entities) }).eq("id", id);
+  ctx.session = {};
+  if (error) return ctx.reply("❌ Error: " + error.message);
+  const chatId = ctx.chat.id;
+  await ctx.reply("✏️ Updating the message in every chat…");
+  void enqueueCm(() => runEditCampaign(id, "text", { chatId }));
+}
+
+async function handleChatEditButtons(ctx: any, s: SessionData) {
+  const id = s.cmEditId!;
+  const raw: string = ctx.message.text.trim();
+  let buttons: CmButton[] = [];
+  if (!/^(none|no|remove)$/i.test(raw)) {
+    const p = parseButtons(raw);
+    if (p.errors.length) return ctx.reply("❌ " + p.errors.join("\n❌ ") + "\n\nSend the buttons again, or send none:", { reply_markup: cancelOnlyKeyboard() });
+    buttons = p.buttons;
+  }
+  const { data: r } = await supabase.from("chat_messages").select("status").eq("id", id).single();
+  if (!r || r.status === "deleted") { ctx.session = {}; return ctx.reply("❌ Not found."); }
+  const { error } = await supabase.from("chat_messages").update({ buttons }).eq("id", id);
+  ctx.session = {};
+  if (error) return ctx.reply("❌ Error: " + error.message);
+  const chatId = ctx.chat.id;
+  await ctx.reply(buttons.length ? "🔗 Updating the buttons in every chat…" : "🔗 Removing the buttons from every chat…");
+  void enqueueCm(() => runEditCampaign(id, "buttons", { chatId }));
+}
+
+bot.callbackQuery(/^cmdel_(.+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const id = ctx.match[1]!;
+  const kb = new InlineKeyboard().text("🗑 YES — Delete for everyone", `cmdelyes_${id}`).row().text("❌ Cancel", "cancel");
+  await ctx.editMessageText(
+    "⚠️ Delete this message from every user's chat?\n\nTelegram only lets a bot delete messages younger than 48 hours; older ones stay in the chat. This CANNOT be undone.",
+    { reply_markup: kb }
+  );
+  await ctx.answerCallbackQuery();
+});
+bot.callbackQuery(/^cmdelyes_(.+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const id = ctx.match[1]!;
+  const { data: r } = await supabase.from("chat_messages").select("status").eq("id", id).single();
+  if (!r || r.status === "deleted") {
+    await ctx.editMessageText("❌ Not found.");
+    return ctx.answerCallbackQuery();
+  }
+  const chatId = ctx.chat!.id;
+  ctx.session = {};
+  await ctx.editMessageText("🗑 Deleting from every chat…");
+  await ctx.answerCallbackQuery();
+  void enqueueCm(() => runEditCampaign(id, "delete", { chatId }));
+});
+
+// private campaigns: send the same message to more accounts later
+bot.callbackQuery(/^cmmore_(.+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  ctx.session = { step: "cm_more", cmEditId: ctx.match[1]! };
+  await ctx.editMessageText(PRIV_PROMPT, { reply_markup: cancelOnlyKeyboard() });
+  await ctx.answerCallbackQuery();
+});
+
+async function handleChatMoreRecipients(ctx: any, s: SessionData, text: string) {
+  const res = await resolveRecipients(text);
+  if (res.tooMany) return ctx.reply(`❌ Too many accounts (max ${PRIV_MAX_RECIPIENTS}).`, { reply_markup: cancelOnlyKeyboard() });
+  if (!res.ids.length) {
+    return ctx.reply("❌ No valid account found." + recipientNotes(res) + "\n\nSend Telegram IDs or @usernames again:", { reply_markup: cancelOnlyKeyboard() });
+  }
+  s.privRecipients = res.ids;
+  s.privLabels = res.labels;
+  s.privNotes = recipientNotes(res);
+  s.step = "cm_more_confirm";
+  const kb = new InlineKeyboard()
+    .text(`✅ Send to ${res.ids.length} more`, "cm_more_apply").row()
+    .text("❌ Cancel", "cancel");
+  await ctx.reply("➕ Send this message also to:\n\n" + recipientsBlock(res.ids, res.labels) + (s.privNotes ?? "") +
+    "\n\nAccounts that already received it are skipped.", { reply_markup: kb });
+}
+
+bot.callbackQuery("cm_more_apply", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const s = ctx.session;
+  if (s.step !== "cm_more_confirm" || !s.cmEditId || !s.privRecipients?.length) {
+    await ctx.editMessageText("❌ Session expired. Start again.");
+    return ctx.answerCallbackQuery();
+  }
+  const id = s.cmEditId;
+  const { data: parent } = await supabase.from("chat_messages").select("id, status, total_count").eq("id", id).eq("is_private", true).single();
+  if (!parent || parent.status === "deleted") {
+    ctx.session = {};
+    await ctx.editMessageText("❌ That private message no longer exists.");
+    return ctx.answerCallbackQuery();
+  }
+  // upsert + ignoreDuplicates: existing deliveries (already sent) are untouched
+  const rows = s.privRecipients.map((uid) => ({ chat_message_id: id, telegram_id: uid }));
+  const up = await supabase.from("chat_message_deliveries").upsert(rows, { onConflict: "chat_message_id,telegram_id", ignoreDuplicates: true });
+  if (up.error) {
+    await ctx.editMessageText("❌ Error: " + up.error.message);
+    return ctx.answerCallbackQuery();
+  }
+  const { count } = await supabase.from("chat_message_deliveries").select("telegram_id", { count: "exact", head: true }).eq("chat_message_id", id);
+  await supabase.from("chat_messages").update({ status: "sending", total_count: count ?? parent.total_count }).eq("id", id);
+  const chatId = ctx.chat!.id;
+  const mid = ctx.callbackQuery.message?.message_id;
+  ctx.session = {};
+  await ctx.editMessageText("📤 Sending to the new accounts…");
+  await ctx.answerCallbackQuery({ text: "Sending…" });
+  void enqueueCm(() => runSendCampaign(id, { chatId, messageId: mid }));
+});
+
 // ─── TEXT HANDLER (all steps) ───────────────────────
 bot.on("message:text", async (ctx) => {
   if (!isAdmin(ctx)) return;
@@ -1160,6 +1805,13 @@ bot.on("message:text", async (ctx) => {
     const p = storyPreview(s);
     return ctx.reply(p.text, { reply_markup: p.kb });
   }
+
+  // CHAT MESSAGES (the bot writes into users' chats)
+  if (s.step === "cm_content") return handleChatTextContent(ctx, s);
+  if (s.step === "cm_buttons") return handleChatButtonsText(ctx, s);
+  if (s.step === "cm_edit_text") return handleChatEditText(ctx, s);
+  if (s.step === "cm_edit_buttons") return handleChatEditButtons(ctx, s);
+  if (s.step === "cm_more") return handleChatMoreRecipients(ctx, s, text);
 
   // PRIVATE MESSAGE: title
   if (s.step === "pmsg_title") {
@@ -1689,5 +2341,6 @@ bot.callbackQuery("msg_confirm", async (ctx) => {
 
 
 // ─── START ──────────────────────────────────────────
+void resumeCampaigns();
 bot.start();
 console.log(`✅ AZOX Admin Bot running (Admin: ${ADMIN_ID})`);
