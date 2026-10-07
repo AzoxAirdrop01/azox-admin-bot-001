@@ -293,7 +293,8 @@ bot.callbackQuery(/^deletemsg_(.+)$/, async (ctx) => {
 // the row in public.stories is what the Mini App reads.
 // ═══════════════════════════════════════════════════
 
-const STORY_BUCKET = "stories";
+const STORY_BUCKET = "stories";                 // public stories (public bucket)
+const STORY_BUCKET_PRIVATE = "stories-private"; // private stories (PRIVATE bucket, signed URLs only)
 const STORY_MAX_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit
 const STORY_MIN_HOURS = 1;
 const STORY_MAX_HOURS = 120;
@@ -487,18 +488,22 @@ async function publishStory(ctx: any, isPrivate: boolean) {
   await ctx.answerCallbackQuery({ text: "Publishing…" });
 
   let uploadedPath: string | null = null;
+  const bucket = isPrivate ? STORY_BUCKET_PRIVATE : STORY_BUCKET;
   try {
     const buf = await downloadTelegramFile(s.storyFileId);
     if (buf.length > STORY_MAX_BYTES) throw new Error("File is larger than 20 MB");
 
     const path = `${new Date().toISOString().slice(0, 10)}/${randomUUID()}.${s.storyExt}`;
     const { error: upErr } = await supabase.storage
-      .from(STORY_BUCKET)
+      .from(bucket)
       .upload(path, buf, { contentType: s.storyMime, upsert: false });
     if (upErr) throw new Error(upErr.message);
     uploadedPath = path;
 
-    const publicUrl = supabase.storage.from(STORY_BUCKET).getPublicUrl(path).data.publicUrl;
+    // Private media has NO public URL: the Mini App server signs a short-lived URL for recipients.
+    const publicUrl = isPrivate
+      ? ""
+      : supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
     const expiresAt = new Date(Date.now() + s.storyHours * 3600_000).toISOString();
 
     const row: Record<string, unknown> = {
@@ -542,7 +547,7 @@ async function publishStory(ctx: any, isPrivate: boolean) {
     );
   } catch (e: any) {
     if (uploadedPath) {
-      await supabase.storage.from(STORY_BUCKET).remove([uploadedPath]).catch(() => {});
+      await supabase.storage.from(bucket).remove([uploadedPath]).catch(() => {});
     }
     const p = isPrivate ? privateStoryPreview(s) : storyPreview(s);
     await ctx.editMessageText(`❌ Could not publish: ${e?.message ?? e}\n\n${p.text}`, { reply_markup: p.kb });
@@ -651,7 +656,7 @@ bot.callbackQuery(/^sty_del_(.+)$/, async (ctx) => {
 bot.callbackQuery(/^sty_delyes_(.+)$/, async (ctx) => {
   if (!await requireAdmin(ctx)) return;
   const id = ctx.match[1];
-  const { data: st } = await supabase.from("stories").select("media_path").eq("id", id).single();
+  const { data: st } = await supabase.from("stories").select("media_path, is_private").eq("id", id).single();
   if (!st) {
     await ctx.editMessageText("❌ Story not found.");
     return ctx.answerCallbackQuery();
@@ -662,7 +667,12 @@ bot.callbackQuery(/^sty_delyes_(.+)$/, async (ctx) => {
   if (error) {
     await ctx.editMessageText(`❌ Error: ${error.message}`);
   } else {
-    await supabase.storage.from(STORY_BUCKET).remove([st.media_path]).catch(() => {});
+    // A private story is removed from the private bucket AND (cleaning up stories that were
+    // published before the private bucket existed) from the public one.
+    const buckets = st.is_private ? [STORY_BUCKET_PRIVATE, STORY_BUCKET] : [STORY_BUCKET];
+    for (const b of buckets) {
+      await supabase.storage.from(b).remove([st.media_path]).catch(() => {});
+    }
     await ctx.editMessageText("✅ Story deleted.");
   }
   await ctx.answerCallbackQuery();
