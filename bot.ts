@@ -131,7 +131,7 @@ function platformKeyboard(prefix: string) {
 bot.command("start", async (ctx) => {
   console.log("[/start] received from:", ctx.from?.id);
   if (isAdmin(ctx)) {
-    await ctx.reply("👋 AZOX Admin Bot\n\nCommands:\n/edit_task — Manage tasks\n/message — Send announcement\n/edit_message — Edit announcements\n/share_story — Manage Story\n/edit_story — edit Story\n/story_privacy — Story Privacy\n/edit_story_privacy — Story Privacy\n/massage_privacy — Massage Privacy\n/edit_massage_privacy — Massage Privacy\n/chat_massage — Chat Massage\n/edit_chat_massage — Edit Chat Massage\n/chat_massage_privacy — Chat Massage Privacy\n/edit_chat_massage_privacy — Edit Chat Massage Privacy\n/ban — Ban accounts\n/edit_gps — GPS settings");
+    await ctx.reply("👋 AZOX Admin Bot\n\nCommands:\n/edit_task — Manage tasks\n/message — Send announcement\n/edit_message — Edit announcements\n/share_story — Manage Story\n/edit_story — edit Story\n/story_privacy — Story Privacy\n/edit_story_privacy — Story Privacy\n/massage_privacy — Massage Privacy\n/edit_massage_privacy — Massage Privacy\n/chat_massage — Chat Massage\n/edit_chat_massage — Edit Chat Massage\n/chat_massage_privacy — Chat Massage Privacy\n/edit_chat_massage_privacy — Edit Chat Massage Privacy\n/ban — Ban accounts\n/edit_gps — GPS settings\n/game_fraze — Games ON/OFF");
   } else {
     await ctx.reply("⛔ Access denied.");
   }
@@ -2021,6 +2021,89 @@ bot.callbackQuery("gps_force_toggle", async (ctx) => {
   }
   await renderGpsMenu(ctx, true);
   await ctx.answerCallbackQuery("Force existing users: " + (next ? "ON" : "OFF"));
+});
+
+// ═══════════════════════════════════════════════════
+// 🎮 /game_fraze — ON/OFF switch per game (cuts server load / cost)
+// ═══════════════════════════════════════════════════
+const GAME_SWITCHES: { id: string; label: string }[] = [
+  { id: "shoot", label: "AZOX Shoot" },
+  { id: "video-ads", label: "AZOX Word" },
+  { id: "snake", label: "AZOX Snake" },
+  { id: "tak-bom", label: "AZOX Tak Bom" },
+  { id: "question-day", label: "AZOX Question Day" },
+  { id: "box", label: "AZOX Box" },
+  { id: "global-button", label: "The global button" },
+  { id: "clicker", label: "Clicker frenzy" },
+];
+
+async function readGameSwitches(): Promise<{ sw: Record<string, boolean>; error?: string }> {
+  const { data, error } = await supabase.rpc("get_game_switches");
+  if (error) return { sw: {}, error: error.message };
+  const raw: any = data ?? {};
+  const sw: Record<string, boolean> = {};
+  // a missing row means ON (same default the app uses)
+  for (const g of GAME_SWITCHES) sw[g.id] = raw[g.id] !== false;
+  return { sw };
+}
+
+function gameSwitchKeyboard(sw: Record<string, boolean>) {
+  const kb = new InlineKeyboard();
+  for (const g of GAME_SWITCHES) {
+    kb.text(`${g.label} — ${sw[g.id] ? "ON ✅" : "OFF 🔴"}`, `gf_${g.id}`).row();
+  }
+  return kb.text("❌ Close", "cancel");
+}
+
+function gameSwitchText(sw: Record<string, boolean>) {
+  const off = GAME_SWITCHES.filter((g) => !sw[g.id]).map((g) => g.label);
+  return (
+    "🎮 Game switches\n\n" +
+    "Tap a game to turn it ON or OFF.\n" +
+    "OFF = the game is locked in the app and its rewards/requests are blocked on the server, so it adds no load.\n\n" +
+    (off.length ? `🔴 Currently OFF: ${off.join(", ")}\n\n` : "✅ All games are ON.\n\n") +
+    "The change reaches users within about a minute."
+  );
+}
+
+async function renderGameSwitches(ctx: any, edit: boolean) {
+  const g = await readGameSwitches();
+  if (g.error) {
+    const msg = "❌ Error: " + g.error;
+    return edit ? ctx.editMessageText(msg).catch(() => {}) : ctx.reply(msg);
+  }
+  const text = gameSwitchText(g.sw);
+  const kb = gameSwitchKeyboard(g.sw);
+  if (edit) {
+    await ctx.editMessageText(text, { reply_markup: kb }).catch(() => {});
+  } else {
+    await ctx.reply(text, { reply_markup: kb });
+  }
+}
+
+bot.command(["game_fraze", "game_freeze"], async (ctx) => {
+  if (await denyNonAdmin(ctx)) return;
+  ctx.session = {};
+  await renderGameSwitches(ctx, false);
+});
+
+bot.callbackQuery(/^gf_(shoot|video-ads|snake|tak-bom|question-day|box|global-button|clicker)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const id = ctx.match[1];
+  const label = GAME_SWITCHES.find((g) => g.id === id)!.label;
+  const cur = await readGameSwitches();
+  if (cur.error) {
+    await ctx.answerCallbackQuery("Error: " + cur.error.slice(0, 150));
+    return;
+  }
+  const next = !cur.sw[id];
+  const { error } = await supabase.rpc("set_game_enabled", { p_game: id, p_enabled: next, p_admin: ADMIN_ID });
+  if (error) {
+    await ctx.answerCallbackQuery("Error: " + error.message.slice(0, 150));
+    return;
+  }
+  await renderGameSwitches(ctx, true);
+  await ctx.answerCallbackQuery(`${label}: ${next ? "ON" : "OFF"}`);
 });
 
 // ─── TEXT HANDLER (all steps) ───────────────────────
