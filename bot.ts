@@ -3,7 +3,7 @@
 
 import { Bot, InlineKeyboard, session } from "grammy";
 import { createClient } from "@supabase/supabase-js";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash, createHmac } from "node:crypto";
 
 // ─── ENV ────────────────────────────────────────────
 const BOT_TOKEN    = process.env.ADMIN_BOT_TOKEN!;
@@ -55,10 +55,23 @@ interface SessionData {
   banLabels?: Record<string, string>;
   // ── story tasks ──
   stKind?: "view" | "like" | "comment";
+  // ── geo targeting (/promo_story, /search_location) ──
+  geoKind?: "promo" | "search";
+  geoStoryId?: string;
+  geoStoryLabel?: string;
+  geoRule?: "include" | "exclude";
+  geoSel?: string[];      // selected country codes
+  geoZoneSel?: string[];  // selected zone ids (Kurdistan areas)
 }
 
 // ─── BOT ────────────────────────────────────────────
-const bot = new Bot<{ session: SessionData }>(BOT_TOKEN);
+// Optional: a self-hosted Telegram Bot API server (lifts the 20 MB download limit of the cloud API).
+// Leave TELEGRAM_API_ROOT unset to keep using api.telegram.org.
+const TELEGRAM_API_ROOT = (process.env.TELEGRAM_API_ROOT ?? "").trim().replace(/\/+$/, "");
+const bot = new Bot<{ session: SessionData }>(
+  BOT_TOKEN,
+  TELEGRAM_API_ROOT ? { client: { apiRoot: TELEGRAM_API_ROOT } } : undefined
+);
 bot.use(session({ initial: (): SessionData => ({}) }));
 
 // ─── ADMIN GUARD ────────────────────────────────────
@@ -133,7 +146,7 @@ function platformKeyboard(prefix: string) {
 bot.command("start", async (ctx) => {
   console.log("[/start] received from:", ctx.from?.id);
   if (isAdmin(ctx)) {
-    await ctx.reply("👋 AZOX Admin Bot\n\nCommands:\n/edit_task — Manage tasks\n/message — Send announcement\n/edit_message — Edit announcements\n/share_story — Manage Story\n/edit_story — edit Story\n/story_privacy — Story Privacy\n/edit_story_privacy — Story Privacy\n/massage_privacy — Massage Privacy\n/edit_massage_privacy — Massage Privacy\n/chat_massage — Chat Massage\n/edit_chat_massage — Edit Chat Massage\n/chat_massage_privacy — Chat Massage Privacy\n/edit_chat_massage_privacy — Edit Chat Massage Privacy\n/ban — Ban accounts\n/edit_gps — GPS settings\n/game_fraze — Games ON/OFF\n/game_change — Gaming page Face 1 / Face 2\n/story_task — Story view / like / comment tasks");
+    await ctx.reply("👋 AZOX Admin Bot\n\nCommands:\n/edit_task — Manage tasks\n/message — Send announcement\n/edit_message — Edit announcements\n/share_story — Manage Story\n/edit_story — edit Story\n/story_privacy — Story Privacy\n/edit_story_privacy — Story Privacy\n/massage_privacy — Massage Privacy\n/edit_massage_privacy — Massage Privacy\n/chat_massage — Chat Massage\n/edit_chat_massage — Edit Chat Massage\n/chat_massage_privacy — Chat Massage Privacy\n/edit_chat_massage_privacy — Edit Chat Massage Privacy\n/ban — Ban accounts\n/edit_gps — GPS settings\n/game_fraze — Games ON/OFF\n/game_change — Gaming page Face 1 / Face 2\n/story_task — Story view / like / comment tasks\n/promo_story — Show a Story only in chosen areas\n/search_location — Count users in chosen areas");
   } else {
     await ctx.reply("⛔ Access denied.");
   }
@@ -308,7 +321,67 @@ bot.callbackQuery(/^deletemsg_(.+)$/, async (ctx) => {
 
 const STORY_BUCKET = "stories";                 // public stories (public bucket)
 const STORY_BUCKET_PRIVATE = "stories-private"; // private stories (PRIVATE bucket, signed URLs only)
-const STORY_MAX_BYTES = 20 * 1024 * 1024; // Telegram Bot API download limit
+// Max story file size in MB. Default 20 = the cloud Bot API download limit.
+// Raising it needs BOTH a self-hosted Bot API server (TELEGRAM_API_ROOT) AND a larger Supabase storage limit.
+const STORY_MAX_MB = Math.min(2000, Math.max(1, Number(process.env.STORY_MAX_MB) || 20));
+const STORY_MAX_BYTES = STORY_MAX_MB * 1024 * 1024;
+
+// ── Cloudflare R2 storage for story media (S3 API, SigV4) ─────────────────────
+// Opt in with STORY_STORAGE=r2 plus R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET.
+// R2 has free egress and no 50 MB cap. Without STORY_STORAGE=r2 the bot keeps using Supabase Storage.
+const R2_ACCOUNT_ID = (process.env.R2_ACCOUNT_ID ?? "").trim();
+const R2_ACCESS_KEY_ID = (process.env.R2_ACCESS_KEY_ID ?? "").trim();
+const R2_SECRET_ACCESS_KEY = (process.env.R2_SECRET_ACCESS_KEY ?? "").trim();
+const R2_BUCKET = (process.env.R2_BUCKET ?? "").trim();
+const USE_R2 = (process.env.STORY_STORAGE ?? "").trim().toLowerCase() === "r2";
+const R2_READY = !!(R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_BUCKET);
+if (USE_R2 && !R2_READY) {
+  console.error("STORY_STORAGE=r2 but R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET are not all set");
+}
+
+function r2Headers(method: "PUT" | "DELETE", key: string, payload: Buffer | string, contentType?: string) {
+  const hmac = (k: Buffer | string, d: string) => createHmac("sha256", k).update(d).digest();
+  const sha = (d: Buffer | string) => createHash("sha256").update(d).digest("hex");
+  const enc = (s: string) =>
+    encodeURIComponent(s).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+
+  const host = `${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+  const amzDate = new Date().toISOString().replace(/[:-]|\.\d{3}/g, "");
+  const date = amzDate.slice(0, 8);
+  const scope = `${date}/auto/s3/aws4_request`;
+  const path = `/${enc(R2_BUCKET)}/${key.split("/").map(enc).join("/")}`;
+  const payloadHash = sha(payload);
+  const h: Record<string, string> = { host, "x-amz-content-sha256": payloadHash, "x-amz-date": amzDate };
+  const names = Object.keys(h).sort();
+  const canonicalHeaders = names.map((n) => `${n}:${h[n]}\n`).join("");
+  const signedHeaders = names.join(";");
+  const canonicalRequest = [method, path, "", canonicalHeaders, signedHeaders, payloadHash].join("\n");
+  const toSign = ["AWS4-HMAC-SHA256", amzDate, scope, sha(canonicalRequest)].join("\n");
+  const kSigning = hmac(hmac(hmac(hmac("AWS4" + R2_SECRET_ACCESS_KEY, date), "auto"), "s3"), "aws4_request");
+  const signature = createHmac("sha256", kSigning).update(toSign).digest("hex");
+  const authorization =
+    `AWS4-HMAC-SHA256 Credential=${R2_ACCESS_KEY_ID}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+  const { host: _host, ...send } = h; // fetch sets Host itself
+  // Content-Type is sent but not signed (allowed by SigV4 and R2).
+  return {
+    url: `https://${host}${path}`,
+    headers: { ...send, ...(contentType ? { "content-type": contentType } : {}), authorization } as Record<string, string>,
+  };
+}
+
+async function r2Put(key: string, body: Buffer, contentType: string): Promise<void> {
+  if (!R2_READY) throw new Error("R2 is not configured (R2_* variables)");
+  const r = r2Headers("PUT", key, body, contentType);
+  const res = await fetch(r.url, { method: "PUT", headers: r.headers, body: body as unknown as BodyInit });
+  if (!res.ok) throw new Error(`R2 upload failed (HTTP ${res.status})`);
+}
+
+async function r2Delete(key: string): Promise<void> {
+  if (!R2_READY) throw new Error("R2 is not configured (R2_* variables)");
+  const r = r2Headers("DELETE", key, "");
+  const res = await fetch(r.url, { method: "DELETE", headers: r.headers });
+  if (!res.ok && res.status !== 404) throw new Error(`R2 delete failed (HTTP ${res.status})`);
+}
 const STORY_MIN_HOURS = 1;
 const STORY_MAX_HOURS = 120;
 const STORY_MAX_LINK_LENGTH = 2048;
@@ -385,7 +458,18 @@ function storyTimeLeft(expiresAt: string): string {
 async function downloadTelegramFile(fileId: string): Promise<Buffer> {
   const file = await bot.api.getFile(fileId);
   if (!file.file_path) throw new Error("Telegram returned no file path");
-  const res = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`);
+  // A local Bot API server started with --local returns an absolute path on its own disk.
+  if (TELEGRAM_API_ROOT && file.file_path.startsWith("/")) {
+    try {
+      const { readFile } = await import("node:fs/promises");
+      return await readFile(file.file_path);
+    } catch {
+      // not on this machine — fall through to HTTP
+    }
+  }
+  const base = TELEGRAM_API_ROOT || "https://api.telegram.org";
+  const rel = file.file_path.replace(/^\/+/, "");
+  const res = await fetch(`${base}/file/bot${BOT_TOKEN}/${rel}`);
   if (!res.ok) throw new Error(`Download failed (HTTP ${res.status})`);
   return Buffer.from(await res.arrayBuffer());
 }
@@ -395,7 +479,7 @@ bot.command("share_story", async (ctx) => {
   if (await denyNonAdmin(ctx)) return;
   ctx.session = { step: "story_media" };
   await ctx.reply(
-    "📖 New Story\n\nSend the photo or video (max 20 MB).\nSupported: JPG, PNG, WEBP, MP4, WEBM, MOV.",
+    `📖 New Story\n\nSend the photo or video (max ${STORY_MAX_MB} MB).\nSupported: JPG, PNG, WEBP, MP4, WEBM, MOV.`,
     { reply_markup: new InlineKeyboard().text("❌ Cancel", "cancel") }
   );
 });
@@ -436,7 +520,7 @@ bot.on(["message:photo", "message:video", "message:animation", "message:document
     return ctx.reply("❌ Unsupported file. Send a JPG, PNG, WEBP, MP4, WEBM or MOV.");
   }
   if (size !== undefined && size > STORY_MAX_BYTES) {
-    return ctx.reply("❌ File is larger than 20 MB. Send a smaller one:");
+    return ctx.reply(`❌ File is larger than ${STORY_MAX_MB} MB. Send a smaller one:`);
   }
 
   s.storyFileId = fileId;
@@ -505,25 +589,33 @@ async function publishStory(ctx: any, isPrivate: boolean) {
   const bucket = isPrivate ? STORY_BUCKET_PRIVATE : STORY_BUCKET;
   try {
     const buf = await downloadTelegramFile(s.storyFileId);
-    if (buf.length > STORY_MAX_BYTES) throw new Error("File is larger than 20 MB");
+    if (buf.length > STORY_MAX_BYTES) throw new Error(`File is larger than ${STORY_MAX_MB} MB`);
 
     const path = `${new Date().toISOString().slice(0, 10)}/${randomUUID()}.${s.storyExt}`;
-    const { error: upErr } = await supabase.storage
-      .from(bucket)
-      .upload(path, buf, { contentType: s.storyMime, upsert: false });
-    if (upErr) throw new Error(upErr.message);
+    if (USE_R2) {
+      await r2Put(path, buf, s.storyMime);
+    } else {
+      const { error: upErr } = await supabase.storage
+        .from(bucket)
+        .upload(path, buf, { contentType: s.storyMime, upsert: false });
+      if (upErr) throw new Error(upErr.message);
+    }
     uploadedPath = path;
 
     // Private media has NO public URL: the Mini App server signs a short-lived URL for recipients.
-    const publicUrl = isPrivate
-      ? ""
-      : supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
+    // R2 media (public or private) is always signed by the Mini App server; media_url is only a placeholder.
+    const publicUrl = USE_R2
+      ? (isPrivate ? "" : `r2://${path}`)
+      : isPrivate
+        ? ""
+        : supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
     const expiresAt = new Date(Date.now() + s.storyHours * 3600_000).toISOString();
 
     const row: Record<string, unknown> = {
       media_type:     s.storyKind,
       media_path:     path,
       media_url:      publicUrl,
+      media_store:    USE_R2 ? "r2" : "supabase",
       link_url:       s.storyLink ?? null,
       duration_hours: s.storyHours,
       expires_at:     expiresAt,
@@ -561,7 +653,8 @@ async function publishStory(ctx: any, isPrivate: boolean) {
     );
   } catch (e: any) {
     if (uploadedPath) {
-      await supabase.storage.from(bucket).remove([uploadedPath]).catch(() => {});
+      if (USE_R2) await r2Delete(uploadedPath).catch(() => {});
+      else await supabase.storage.from(bucket).remove([uploadedPath]).catch(() => {});
     }
     const p = isPrivate ? privateStoryPreview(s) : storyPreview(s);
     await ctx.editMessageText(`❌ Could not publish: ${e?.message ?? e}\n\n${p.text}`, { reply_markup: p.kb });
@@ -670,7 +763,7 @@ bot.callbackQuery(/^sty_del_(.+)$/, async (ctx) => {
 bot.callbackQuery(/^sty_delyes_(.+)$/, async (ctx) => {
   if (!await requireAdmin(ctx)) return;
   const id = ctx.match[1];
-  const { data: st } = await supabase.from("stories").select("media_path, is_private").eq("id", id).single();
+  const { data: st } = await supabase.from("stories").select("media_path, is_private, media_store").eq("id", id).single();
   if (!st) {
     await ctx.editMessageText("❌ Story not found.");
     return ctx.answerCallbackQuery();
@@ -683,9 +776,13 @@ bot.callbackQuery(/^sty_delyes_(.+)$/, async (ctx) => {
   } else {
     // A private story is removed from the private bucket AND (cleaning up stories that were
     // published before the private bucket existed) from the public one.
-    const buckets = st.is_private ? [STORY_BUCKET_PRIVATE, STORY_BUCKET] : [STORY_BUCKET];
-    for (const b of buckets) {
-      await supabase.storage.from(b).remove([st.media_path]).catch(() => {});
+    if ((st as any).media_store === "r2") {
+      await r2Delete(st.media_path).catch(() => {});
+    } else {
+      const buckets = st.is_private ? [STORY_BUCKET_PRIVATE, STORY_BUCKET] : [STORY_BUCKET];
+      for (const b of buckets) {
+        await supabase.storage.from(b).remove([st.media_path]).catch(() => {});
+      }
     }
     await ctx.editMessageText("✅ Story deleted.");
   }
@@ -844,7 +941,7 @@ bot.command(["story_privacy"], async (ctx) => {
   if (await denyNonAdmin(ctx)) return;
   ctx.session = { step: "story_media", storyPrivate: true };
   await ctx.reply(
-    "🔒 New Private Story\n\nSend the photo or video (max 20 MB).\nSupported: JPG, PNG, WEBP, MP4, WEBM, MOV.",
+    `🔒 New Private Story\n\nSend the photo or video (max ${STORY_MAX_MB} MB).\nSupported: JPG, PNG, WEBP, MP4, WEBM, MOV.`,
     { reply_markup: cancelOnlyKeyboard() }
   );
 });
@@ -1928,19 +2025,52 @@ async function readGps(): Promise<{ mode: GpsMode; force: boolean; forceOnce: bo
   return { mode, force: !!(data as any)?.force_existing, forceOnce: !!(data as any)?.force_existing_once, stats };
 }
 
-function gpsKeyboard(mode: GpsMode, force: boolean, forceOnce: boolean) {
+// Per-area GPS policy: ON = required, FREE = optional, OFF = not needed.
+// Replaces the global mode for users whose latest GPS fix is inside the area.
+type GpsAreaMode = "on" | "free" | "off" | null;
+type GpsArea = { id: string; title: string; mode: GpsAreaMode; users: number };
+
+async function readGpsAreas(): Promise<GpsArea[]> {
+  const { data, error } = await supabase.rpc("get_area_gps_modes");
+  if (error || !Array.isArray(data)) return [];
+  return (data as any[]).map((a) => ({
+    id: String(a.id),
+    title: String(a.title ?? a.id),
+    mode: a.mode === "on" || a.mode === "free" || a.mode === "off" ? a.mode : null,
+    users: Number(a.users) || 0,
+  }));
+}
+
+function gpsKeyboard(mode: GpsMode, force: boolean, forceOnce: boolean, areas: GpsArea[] = []) {
   const mark = (m: GpsMode) => (mode === m ? "✅ " : "") + GPS_MODE_LABEL[m];
-  return new InlineKeyboard()
+  const kb = new InlineKeyboard()
     .text(mark("off"), "gps_mode_off")
     .text(mark("optional"), "gps_mode_optional")
     .text(mark("required"), "gps_mode_required").row()
     .text(mark("once"), "gps_mode_once").row()
     .text(`Force existing users: ${force ? "ON ✅" : "OFF"}`, "gps_force_toggle").row()
-    .text(`Force existing users once: ${forceOnce ? "ON ✅" : "OFF"}`, "gps_force_once_toggle").row()
-    .text("❌ Close", "cancel");
+    .text(`Force existing users once: ${forceOnce ? "ON ✅" : "OFF"}`, "gps_force_once_toggle").row();
+  for (const a of areas) {
+    const m = (x: GpsAreaMode, label: string) => (a.mode === x ? "✅ " : "") + label;
+    kb.text(`📍 ${a.title}`, "gpsa_noop").row()
+      .text(m("on", "ON"), `gpsa_${a.id}_on`)
+      .text(m("free", "FREE"), `gpsa_${a.id}_free`)
+      .text(m("off", "OFF"), `gpsa_${a.id}_off`)
+      .text(a.mode === null ? "✅ Global" : "↩️ Global", `gpsa_${a.id}_follow`)
+      .row();
+  }
+  return kb.text("❌ Close", "cancel");
 }
 
-async function gpsMenuText(g: Awaited<ReturnType<typeof readGps>>) {
+async function gpsMenuText(g: Awaited<ReturnType<typeof readGps>>, areas: GpsArea[] = []) {
+  const areaLabel = (m: GpsAreaMode) =>
+    m === "on" ? "ON (required)" : m === "free" ? "FREE (optional)" : m === "off" ? "OFF (not needed)" : "Global";
+  const areaBlock = areas.length
+    ? "\n\n🗺 Areas (replace the global mode for users whose last GPS fix is inside the area):\n" +
+      areas.map((a) => `• ${a.title}: ${areaLabel(a.mode)} — ${a.users} user(s) located there`).join("\n") +
+      "\nON = must share location · FREE = optional · OFF = never asked · Global = follow the mode above." +
+      "\nA user whose location is unknown, or whose last fix is outside the area, follows the global mode."
+    : "";
   const stats = g.stats
     ? `\n\n👥 Users with a saved location: ${g.stats.withLoc} / ${g.stats.total}\n🚫 Banned accounts: ${g.stats.banned}`
     : "";
@@ -1950,6 +2080,7 @@ async function gpsMenuText(g: Awaited<ReturnType<typeof readGps>>) {
     `Force existing users: ${g.force ? "ON" : "OFF"} (applies to Required)\n` +
     `Force existing users once: ${g.forceOnce ? "ON" : "OFF"} (applies to Once)` +
     stats +
+    areaBlock +
     "\n\n• Off — location is never requested.\n" +
     "• Optional — the app asks in the background; users can still enter if they decline.\n" +
     "• Required — new users must share location every time they enter. Existing users are not affected unless \"Force existing users\" is ON.\n" +
@@ -1964,8 +2095,9 @@ async function renderGpsMenu(ctx: any, edit: boolean) {
     const msg = "❌ Error: " + g.error;
     return edit ? ctx.editMessageText(msg).catch(() => {}) : ctx.reply(msg);
   }
-  const text = await gpsMenuText(g);
-  const kb = gpsKeyboard(g.mode, g.force, g.forceOnce);
+  const areas = await readGpsAreas();
+  const text = await gpsMenuText(g, areas);
+  const kb = gpsKeyboard(g.mode, g.force, g.forceOnce, areas);
   if (edit) {
     await ctx.editMessageText(text, { reply_markup: kb }).catch(() => {});
   } else {
@@ -1989,6 +2121,27 @@ bot.callbackQuery(/^gps_mode_(off|optional|required|once)$/, async (ctx) => {
   }
   await renderGpsMenu(ctx, true);
   await ctx.answerCallbackQuery("Mode: " + GPS_MODE_LABEL[mode]);
+});
+
+bot.callbackQuery("gpsa_noop", async (ctx) => {
+  await ctx.answerCallbackQuery();
+});
+
+bot.callbackQuery(/^gpsa_([a-z0-9_]+)_(on|free|off|follow)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const area = ctx.match[1];
+  const mode = ctx.match[2];
+  const { error } = await supabase.rpc("set_area_gps_mode", { p_area: area, p_mode: mode, p_admin: ADMIN_ID });
+  if (error) {
+    await ctx.answerCallbackQuery("Error: " + error.message.slice(0, 150));
+    return;
+  }
+  await renderGpsMenu(ctx, true);
+  await ctx.answerCallbackQuery(
+    mode === "on" ? "Area GPS: ON (required)" :
+    mode === "free" ? "Area GPS: FREE (optional)" :
+    mode === "off" ? "Area GPS: OFF" : "Area follows the global mode"
+  );
 });
 
 bot.callbackQuery("gps_force_once_toggle", async (ctx) => {
@@ -2294,6 +2447,510 @@ async function handleStoryTaskUnits(ctx: any, s: SessionData, text: string) {
   await renderStoryTaskMenu(ctx, false);
 }
 
+// ═══════════════════════════════════════════════════
+// 🌍 /promo_story and /search_location — geo targeting
+//   Both commands share one selection screen:
+//   • ON/OFF buttons for region groups and the Kurdistan zones
+//   • a fixed numbered list of countries (1..250) — type numbers like  1 . 2 . 4 . 73  (or -5 to remove)
+//   /promo_story   → Save writes the rule on the chosen story (set_story_geo_rule)
+//   /search_location → Count shows how many registered users are in the chosen area (count_geo_users)
+//   The catalog lives in the database tables geo_countries, geo_groups, geo_zones.
+// ═══════════════════════════════════════════════════
+type GeoCountry = { num: number; code: string; name: string };
+type GeoGroup = { id: string; title: string; sort: number; codes: string[] };
+type GeoZone = { id: string; title: string; sort: number };
+type GeoCatalog = {
+  countries: GeoCountry[];
+  groups: GeoGroup[];
+  zones: GeoZone[];
+  byNum: Map<number, GeoCountry>;
+  byCode: Map<string, GeoCountry>;
+};
+
+let geoCatalogCache: { at: number; data: GeoCatalog } | null = null;
+
+async function loadGeoCatalog(): Promise<GeoCatalog> {
+  if (geoCatalogCache && Date.now() - geoCatalogCache.at < 10 * 60 * 1000) {
+    return geoCatalogCache.data;
+  }
+  const [c, g, z] = await Promise.all([
+    supabase.from("geo_countries").select("num, code, name").order("num", { ascending: true }).limit(1000),
+    supabase.from("geo_groups").select("id, title, sort, codes").order("sort", { ascending: true }).limit(200),
+    supabase.from("geo_zones").select("id, title, sort").order("sort", { ascending: true }).limit(50),
+  ]);
+  if (c.error) throw new Error(c.error.message);
+  if (g.error) throw new Error(g.error.message);
+  if (z.error) throw new Error(z.error.message);
+  const countries = (c.data ?? []) as GeoCountry[];
+  const data: GeoCatalog = {
+    countries,
+    groups: (g.data ?? []) as GeoGroup[],
+    zones: (z.data ?? []) as GeoZone[],
+    byNum: new Map(countries.map((x) => [x.num, x])),
+    byCode: new Map(countries.map((x) => [x.code, x])),
+  };
+  geoCatalogCache = { at: Date.now(), data };
+  return data;
+}
+
+function geoSelected(s: SessionData) {
+  return {
+    codes: new Set<string>(s.geoSel ?? []),
+    zones: new Set<string>(s.geoZoneSel ?? []),
+  };
+}
+
+// A group shows ON when every country in it is selected.
+function geoGroupOn(sel: Set<string>, grp: GeoGroup) {
+  return grp.codes.length > 0 && grp.codes.every((c) => sel.has(c));
+}
+
+function geoSummaryText(s: SessionData, cat: GeoCatalog) {
+  const { codes, zones } = geoSelected(s);
+  const lines: string[] = [];
+
+  const zoneNames = cat.zones.filter((z) => zones.has(z.id)).map((z) => z.title);
+  lines.push("🏔 Kurdistan zones: " + (zoneNames.length ? zoneNames.join(", ") : "—"));
+
+  const groupNames = cat.groups.filter((g) => geoGroupOn(codes, g)).map((g) => g.title);
+  lines.push("🗺 Groups ON: " + (groupNames.length ? groupNames.join(", ") : "—"));
+
+  const names = [...codes].map((c) => cat.byCode.get(c)).filter(Boolean) as GeoCountry[];
+  names.sort((a, b) => a.num - b.num);
+  const shown = names.slice(0, 40).map((n) => `${n.num} ${n.name}`);
+  const more = names.length > 40 ? ` … +${names.length - 40} more` : "";
+  lines.push(`🌍 Countries selected: ${names.length}` + (names.length ? "\n" + shown.join(", ") + more : ""));
+
+  return lines.join("\n");
+}
+
+function geoMenuText(s: SessionData, cat: GeoCatalog) {
+  const summary = geoSummaryText(s, cat);
+  if (s.geoKind === "promo") {
+    const mode = s.geoRule === "exclude"
+      ? "🚫 Mode: EVERYONE EXCEPT the selection (the selected areas will NOT see the story)"
+      : "✅ Mode: ONLY the selection (only the selected areas see the story)";
+    return (
+      "🎯 Promo Story — " + (s.geoStoryLabel ?? "") + "\n\n" +
+      mode + "\n\n" + summary + "\n\n" +
+      "• Tap a button to turn a group ON/OFF.\n" +
+      "• 🔢 Numbers — type country numbers, e.g. 1 . 2 . 4 . 73  (use -5 to remove one).\n" +
+      "• 📋 Country list — see the numbers.\n" +
+      "• A user whose location is unknown: hidden in ONLY mode, shown in EVERYONE EXCEPT mode.\n" +
+      "• 🌐 Everyone — removes the filter from this story."
+    );
+  }
+  return (
+    "🔎 Search location\n\n" + summary + "\n\n" +
+    "• Tap a button to turn a group ON/OFF.\n" +
+    "• 🔢 Numbers — type country numbers, e.g. 1 . 2 . 4 . 73  (use -5 to remove one).\n" +
+    "• 📋 Country list — see the numbers.\n" +
+    "• Then tap 🔎 Count users."
+  );
+}
+
+function geoKeyboard(s: SessionData, cat: GeoCatalog) {
+  const { codes, zones } = geoSelected(s);
+  const kb = new InlineKeyboard();
+
+  // Kurdistan zones first
+  cat.zones.forEach((z, i) => {
+    kb.text(`${zones.has(z.id) ? "ON ✅" : "OFF ⚪️"} ${z.title}`, `geo_z_${z.id}`);
+    if (i % 2 === 1) kb.row();
+  });
+  if (cat.zones.length % 2 === 1) kb.row();
+
+  // Region groups
+  cat.groups.forEach((g, i) => {
+    kb.text(`${geoGroupOn(codes, g) ? "ON ✅" : "OFF ⚪️"} ${g.title}`, `geo_g_${g.id}`);
+    if (i % 2 === 1) kb.row();
+  });
+  if (cat.groups.length % 2 === 1) kb.row();
+
+  kb.text("🔢 Numbers", "geo_nums").text("📋 Country list", "geo_list_0").row();
+  if (s.geoKind === "promo") {
+    kb.text(s.geoRule === "exclude" ? "🚫 Mode: Everyone except" : "✅ Mode: Only selection", "geo_mode").row();
+  }
+  kb.text("🧹 Clear selection", "geo_clear");
+  if (s.geoKind === "promo") {
+    kb.text("🌐 Everyone", "geo_all").row().text("💾 Save", "geo_save");
+  } else {
+    kb.row().text("🔎 Count users", "geo_run");
+  }
+  return kb.text("❌ Close", "cancel");
+}
+
+async function renderGeoMenu(ctx: any, edit: boolean) {
+  let cat: GeoCatalog;
+  try {
+    cat = await loadGeoCatalog();
+  } catch (e: any) {
+    const msg = "❌ Error loading the location list: " + (e?.message ?? e);
+    return edit ? ctx.editMessageText(msg).catch(() => {}) : ctx.reply(msg);
+  }
+  const s: SessionData = ctx.session ?? {};
+  const text = geoMenuText(s, cat);
+  const kb = geoKeyboard(s, cat);
+  if (edit) {
+    await ctx.editMessageText(text, { reply_markup: kb }).catch(() => {});
+  } else {
+    await ctx.reply(text, { reply_markup: kb });
+  }
+}
+
+// Session guard: the selection lives in memory, so a bot restart clears it.
+async function geoSessionOk(ctx: any) {
+  if (ctx.session?.geoKind === "search") return true;
+  if (ctx.session?.geoKind === "promo" && ctx.session?.geoStoryId) return true;
+  await ctx.answerCallbackQuery("Session expired — run the command again").catch(() => {});
+  return false;
+}
+
+// ── /promo_story — pick a story ──
+bot.command("promo_story", async (ctx) => {
+  if (await denyNonAdmin(ctx)) return;
+  ctx.session = {};
+  const { data: stories, error } = await supabase
+    .from("stories")
+    .select("id, media_type, link_url, created_at, expires_at, is_private, geo_rule")
+    .order("created_at", { ascending: false })
+    .limit(10);
+
+  if (error) return ctx.reply("❌ Error: " + error.message);
+  if (!stories || stories.length === 0) {
+    return ctx.reply("📖 No stories yet. Use /share_story to publish one.");
+  }
+
+  const kb = new InlineKeyboard();
+  stories.forEach((st: any) => {
+    const active = new Date(st.expires_at).getTime() > Date.now();
+    const kind = st.media_type === "video" ? "🎬" : "🖼";
+    const priv = st.is_private ? " 🔒" : "";
+    const geo = st.geo_rule ? " 🎯" : "";
+    kb.text(`${active ? "🟢" : "⚪️"} ${kind} ${storyTimeLeft(st.expires_at)}${priv}${geo}`, `geo_pick_${st.id}`).row();
+  });
+  kb.text("❌ Cancel", "cancel");
+  await ctx.reply(
+    "🎯 Promo Story — choose a story.\n🎯 = already limited to some areas.",
+    { reply_markup: kb }
+  );
+});
+
+bot.callbackQuery(/^geo_pick_(.+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const id = ctx.match[1];
+  const { data: st, error } = await supabase
+    .from("stories")
+    .select("id, media_type, expires_at, geo_rule")
+    .eq("id", id)
+    .single();
+  if (error || !st) {
+    await ctx.editMessageText("❌ Story not found.").catch(() => {});
+    return ctx.answerCallbackQuery();
+  }
+
+  let cat: GeoCatalog;
+  try {
+    cat = await loadGeoCatalog();
+  } catch (e: any) {
+    await ctx.editMessageText("❌ Error loading the location list: " + (e?.message ?? e)).catch(() => {});
+    return ctx.answerCallbackQuery();
+  }
+
+  // Start from the rule already saved on the story (if any)
+  const rule: any = (st as any).geo_rule;
+  const mode: "include" | "exclude" = rule?.mode === "exclude" ? "exclude" : "include";
+  const validCodes = ((rule?.countries ?? []) as string[]).filter((c) => cat.byCode.has(c));
+  const validZones = ((rule?.zones ?? []) as string[]).filter((z) => cat.zones.some((x) => x.id === z));
+
+  const kind = (st as any).media_type === "video" ? "🎬" : "🖼";
+  ctx.session = {
+    geoKind: "promo",
+    geoStoryId: id,
+    geoStoryLabel: `${kind} ${storyTimeLeft((st as any).expires_at)}`,
+    geoRule: mode,
+    geoSel: validCodes,
+    geoZoneSel: validZones,
+  };
+  await renderGeoMenu(ctx, true);
+  await ctx.answerCallbackQuery();
+});
+
+// ── /search_location (and the typo alias /search_locatio) ──
+async function startGeoSearch(ctx: any) {
+  if (await denyNonAdmin(ctx)) return;
+  ctx.session = { geoKind: "search", geoSel: [], geoZoneSel: [] };
+  await renderGeoMenu(ctx, false);
+}
+bot.command("search_location", startGeoSearch);
+bot.command("search_locatio", startGeoSearch);
+
+// ── toggles ──
+bot.callbackQuery(/^geo_z_(.+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  if (!await geoSessionOk(ctx)) return;
+  const id = ctx.match[1];
+  const cat = await loadGeoCatalog().catch(() => null);
+  if (!cat || !cat.zones.some((z) => z.id === id)) return ctx.answerCallbackQuery("Unknown zone");
+  const zones = new Set<string>(ctx.session.geoZoneSel ?? []);
+  if (zones.has(id)) zones.delete(id); else zones.add(id);
+  ctx.session.geoZoneSel = [...zones];
+  await renderGeoMenu(ctx, true);
+  await ctx.answerCallbackQuery();
+});
+
+bot.callbackQuery(/^geo_g_(.+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  if (!await geoSessionOk(ctx)) return;
+  const id = ctx.match[1];
+  const cat = await loadGeoCatalog().catch(() => null);
+  const grp = cat?.groups.find((g) => g.id === id);
+  if (!cat || !grp) return ctx.answerCallbackQuery("Unknown group");
+  const sel = new Set<string>(ctx.session.geoSel ?? []);
+  if (geoGroupOn(sel, grp)) {
+    grp.codes.forEach((c) => sel.delete(c));
+  } else {
+    grp.codes.forEach((c) => sel.add(c));
+  }
+  ctx.session.geoSel = [...sel];
+  await renderGeoMenu(ctx, true);
+  await ctx.answerCallbackQuery();
+});
+
+bot.callbackQuery("geo_mode", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  if (!await geoSessionOk(ctx)) return;
+  ctx.session.geoRule = ctx.session.geoRule === "exclude" ? "include" : "exclude";
+  await renderGeoMenu(ctx, true);
+  await ctx.answerCallbackQuery(ctx.session.geoRule === "exclude" ? "Everyone except the selection" : "Only the selection");
+});
+
+bot.callbackQuery("geo_clear", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  if (!await geoSessionOk(ctx)) return;
+  ctx.session.geoSel = [];
+  ctx.session.geoZoneSel = [];
+  await renderGeoMenu(ctx, true);
+  await ctx.answerCallbackQuery("Selection cleared");
+});
+
+// ── numbered country list (paginated, sent as a separate message) ──
+const GEO_LIST_PAGE = 60;
+
+async function renderGeoList(ctx: any, page: number) {
+  const cat = await loadGeoCatalog();
+  const pages = Math.max(1, Math.ceil(cat.countries.length / GEO_LIST_PAGE));
+  const p = Math.min(Math.max(page, 0), pages - 1);
+  const slice = cat.countries.slice(p * GEO_LIST_PAGE, (p + 1) * GEO_LIST_PAGE);
+  const sel = new Set<string>(ctx.session?.geoSel ?? []);
+  const lines = slice.map((c) => `${sel.has(c.code) ? "✅" : "▫️"} ${c.num}. ${c.name}`).join("\n");
+  const text = `📋 Countries — page ${p + 1}/${pages}\n\n${lines}`;
+  const kb = new InlineKeyboard();
+  if (p > 0) kb.text("◀️ Prev", `geo_list_${p - 1}`);
+  if (p < pages - 1) kb.text("Next ▶️", `geo_list_${p + 1}`);
+  kb.row().text("✖️ Close list", "geo_list_close");
+  return { text, kb };
+}
+
+bot.callbackQuery(/^geo_list_(\d+)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const page = parseInt(ctx.match[1], 10);
+  let r;
+  try {
+    r = await renderGeoList(ctx, page);
+  } catch (e: any) {
+    return ctx.answerCallbackQuery("Error: " + String(e?.message ?? e).slice(0, 150));
+  }
+  // The menu button opens a new message; the page buttons edit that list message.
+  const fromMenu = page === 0 && !(ctx.callbackQuery.message?.text ?? "").startsWith("📋 Countries");
+  if (fromMenu) {
+    await ctx.reply(r.text, { reply_markup: r.kb });
+  } else {
+    await ctx.editMessageText(r.text, { reply_markup: r.kb }).catch(() => {});
+  }
+  await ctx.answerCallbackQuery();
+});
+
+bot.callbackQuery("geo_list_close", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  await ctx.deleteMessage().catch(() => {});
+  await ctx.answerCallbackQuery();
+});
+
+// ── typed numbers ──
+bot.callbackQuery("geo_nums", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  if (!await geoSessionOk(ctx)) return;
+  ctx.session.step = "geo_nums";
+  await ctx.reply(
+    "🔢 Send country numbers, for example:\n1 . 2 . 4 . 73 . 8\n\n" +
+    "• Numbers add countries.\n" +
+    "• A minus sign removes: -5 . -8\n" +
+    "• Separators: dot, comma, space or Arabic comma.\n" +
+    "• Use 📋 Country list to see the numbers (1 to 250).",
+    { reply_markup: cancelOnlyKeyboard() }
+  );
+  await ctx.answerCallbackQuery();
+});
+
+// Arabic-Indic (٠-٩) and Persian (۰-۹) digits → ASCII; fancy minus signs → "-"
+function geoNormalizeDigits(t: string) {
+  return t
+    .replace(/[٠-٩]/g, (d) => String(d.charCodeAt(0) - 0x0660))
+    .replace(/[۰-۹]/g, (d) => String(d.charCodeAt(0) - 0x06F0))
+    .replace(/[−–—]/g, "-");
+}
+
+async function handleGeoNums(ctx: any, s: SessionData, text: string) {
+  if (s.geoKind !== "promo" && s.geoKind !== "search") { ctx.session = {}; return; }
+  const cat = await loadGeoCatalog().catch(() => null);
+  if (!cat) return ctx.reply("❌ Error loading the location list. Try again.");
+
+  const tokens = geoNormalizeDigits(text).split(/[\s.,،;؛]+/).filter(Boolean);
+  if (tokens.length === 0) {
+    return ctx.reply("❌ Send numbers like: 1 . 2 . 4 . 73", { reply_markup: cancelOnlyKeyboard() });
+  }
+
+  const add: GeoCountry[] = [];
+  const remove: GeoCountry[] = [];
+  const bad: string[] = [];
+  for (const tok of tokens) {
+    const m = /^(-?)(\d{1,3})$/.exec(tok);
+    if (!m) { bad.push(tok); continue; }
+    const c = cat.byNum.get(parseInt(m[2], 10));
+    if (!c) { bad.push(tok); continue; }
+    (m[1] ? remove : add).push(c);
+  }
+  if (bad.length) {
+    return ctx.reply(
+      "❌ Not valid: " + bad.slice(0, 15).join(" , ") + (bad.length > 15 ? " …" : "") +
+      `\nNumbers must be 1 to ${cat.countries.length}. Nothing was changed — send it again:`,
+      { reply_markup: cancelOnlyKeyboard() }
+    );
+  }
+
+  const sel = new Set<string>(s.geoSel ?? []);
+  add.forEach((c) => sel.add(c.code));
+  remove.forEach((c) => sel.delete(c.code));
+  ctx.session.geoSel = [...sel];
+  ctx.session.step = undefined;
+
+  const parts: string[] = [];
+  if (add.length) parts.push("➕ " + [...new Set(add.map((c) => c.name))].join(", "));
+  if (remove.length) parts.push("➖ " + [...new Set(remove.map((c) => c.name))].join(", "));
+  await ctx.reply("✅ Updated\n" + parts.join("\n"));
+  await renderGeoMenu(ctx, false);
+}
+
+// ── promo: save / everyone ──
+bot.callbackQuery("geo_save", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  if (!await geoSessionOk(ctx)) return;
+  const s: SessionData = ctx.session;
+  if (s.geoKind !== "promo" || !s.geoStoryId) return ctx.answerCallbackQuery("Run /promo_story again");
+
+  const countries = [...new Set(s.geoSel ?? [])];
+  const zones = [...new Set(s.geoZoneSel ?? [])];
+  if (countries.length === 0 && zones.length === 0) {
+    return ctx.answerCallbackQuery("Nothing selected. Pick an area, or tap 🌐 Everyone.");
+  }
+  const mode = s.geoRule === "exclude" ? "exclude" : "include";
+  const { error } = await supabase.rpc("set_story_geo_rule", {
+    p_story_id: s.geoStoryId,
+    p_rule: { mode, countries, zones },
+  });
+  if (error) {
+    return ctx.answerCallbackQuery("Error: " + error.message.slice(0, 150));
+  }
+  const cat = await loadGeoCatalog().catch(() => null);
+  const summary = cat ? geoSummaryText(s, cat) : "";
+  const label = s.geoStoryLabel ?? "";
+  ctx.session = {};
+  await ctx.editMessageText(
+    "✅ Saved — " + label + "\n\n" +
+    (mode === "exclude"
+      ? "🚫 EVERYONE EXCEPT the selection sees this story."
+      : "✅ ONLY the selection sees this story.") +
+    "\n\n" + summary
+  ).catch(() => {});
+  await ctx.answerCallbackQuery("Saved");
+});
+
+bot.callbackQuery("geo_all", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  if (!await geoSessionOk(ctx)) return;
+  const s: SessionData = ctx.session;
+  if (s.geoKind !== "promo" || !s.geoStoryId) return ctx.answerCallbackQuery("Run /promo_story again");
+  const { error } = await supabase.rpc("set_story_geo_rule", {
+    p_story_id: s.geoStoryId,
+    p_rule: null,
+  });
+  if (error) {
+    return ctx.answerCallbackQuery("Error: " + error.message.slice(0, 150));
+  }
+  const label = s.geoStoryLabel ?? "";
+  ctx.session = {};
+  await ctx.editMessageText("✅ " + label + "\n\n🌐 This story is now visible to everyone.").catch(() => {});
+  await ctx.answerCallbackQuery("Everyone");
+});
+
+// ── search: count users ──
+bot.callbackQuery("geo_run", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  if (!await geoSessionOk(ctx)) return;
+  const s: SessionData = ctx.session;
+  const countries = [...new Set(s.geoSel ?? [])];
+  const zones = [...new Set(s.geoZoneSel ?? [])];
+  if (countries.length === 0 && zones.length === 0) {
+    return ctx.answerCallbackQuery("Nothing selected. Pick an area first.");
+  }
+  const { data, error } = await supabase.rpc("count_geo_users", {
+    p_countries: countries,
+    p_zones: zones,
+  });
+  if (error || !data) {
+    return ctx.answerCallbackQuery("Error: " + (error?.message ?? "no data").slice(0, 150));
+  }
+  const d: any = data;
+  const cat = await loadGeoCatalog().catch(() => null);
+  const total = Number(d.total) || 0;
+  const known = Number(d.known) || 0;
+  const matched = Number(d.matched) || 0;
+  const pct = known > 0 ? ((matched / known) * 100).toFixed(1) : "0";
+
+  const lines: string[] = [
+    "🔎 Search result",
+    "",
+    `👥 Users in the selected area: ${matched}`,
+    `📍 Users with a known location: ${known} (${pct}% of them are in the area)`,
+    `❓ Unknown location: ${Math.max(0, total - known)}`,
+    `🧮 All registered users: ${total}`,
+  ];
+  const byZone: Record<string, number> = d.by_zone ?? {};
+  const zoneLines = (cat?.zones ?? []).filter((z) => byZone[z.id] != null)
+    .map((z) => `• ${z.title}: ${byZone[z.id]}`);
+  if (zoneLines.length) lines.push("", "🏔 Kurdistan zones:", ...zoneLines);
+  const byCountry: any[] = Array.isArray(d.by_country) ? d.by_country : [];
+  if (byCountry.length) {
+    lines.push("", "🌍 Top countries:", ...byCountry.map((c) => `• ${c.name}: ${c.count}`));
+  }
+  lines.push("", "A user counts once, even if they match several selected areas.");
+  if (known === 0) {
+    lines.push("", "⚠️ No user has a saved location yet. Locations are saved when a user opens the Mini App.");
+  }
+
+  const kb = new InlineKeyboard().text("⬅️ Back to selection", "geo_back").text("❌ Close", "cancel");
+  await ctx.editMessageText(lines.join("\n"), { reply_markup: kb }).catch(() => {});
+  await ctx.answerCallbackQuery();
+});
+
+bot.callbackQuery("geo_back", async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  if (!await geoSessionOk(ctx)) return;
+  await renderGeoMenu(ctx, true);
+  await ctx.answerCallbackQuery();
+});
+
 // ─── TEXT HANDLER (all steps) ───────────────────────
 bot.on("message:text", async (ctx) => {
   if (!isAdmin(ctx)) return;
@@ -2338,6 +2995,9 @@ bot.on("message:text", async (ctx) => {
 
   // STORY TASKS: number of tasks per kind
   if (s.step === "st_units") return handleStoryTaskUnits(ctx, s, text);
+
+  // GEO TARGETING: country numbers typed by hand
+  if (s.step === "geo_nums") return handleGeoNums(ctx, s, text);
 
   // CHAT MESSAGES (the bot writes into users' chats)
   if (s.step === "cm_content") return handleChatTextContent(ctx, s);
