@@ -53,6 +53,8 @@ interface SessionData {
   // ── ban ──
   banIds?: number[];
   banLabels?: Record<string, string>;
+  // ── story tasks ──
+  stKind?: "view" | "like" | "comment";
 }
 
 // ─── BOT ────────────────────────────────────────────
@@ -131,7 +133,7 @@ function platformKeyboard(prefix: string) {
 bot.command("start", async (ctx) => {
   console.log("[/start] received from:", ctx.from?.id);
   if (isAdmin(ctx)) {
-    await ctx.reply("👋 AZOX Admin Bot\n\nCommands:\n/edit_task — Manage tasks\n/message — Send announcement\n/edit_message — Edit announcements\n/share_story — Manage Story\n/edit_story — edit Story\n/story_privacy — Story Privacy\n/edit_story_privacy — Story Privacy\n/massage_privacy — Massage Privacy\n/edit_massage_privacy — Massage Privacy\n/chat_massage — Chat Massage\n/edit_chat_massage — Edit Chat Massage\n/chat_massage_privacy — Chat Massage Privacy\n/edit_chat_massage_privacy — Edit Chat Massage Privacy\n/ban — Ban accounts\n/edit_gps — GPS settings\n/game_fraze — Games ON/OFF");
+    await ctx.reply("👋 AZOX Admin Bot\n\nCommands:\n/edit_task — Manage tasks\n/message — Send announcement\n/edit_message — Edit announcements\n/share_story — Manage Story\n/edit_story — edit Story\n/story_privacy — Story Privacy\n/edit_story_privacy — Story Privacy\n/massage_privacy — Massage Privacy\n/edit_massage_privacy — Massage Privacy\n/chat_massage — Chat Massage\n/edit_chat_massage — Edit Chat Massage\n/chat_massage_privacy — Chat Massage Privacy\n/edit_chat_massage_privacy — Edit Chat Massage Privacy\n/ban — Ban accounts\n/edit_gps — GPS settings\n/game_fraze — Games ON/OFF\n/game_change — Gaming page Face 1 / Face 2\n/story_task — Story view / like / comment tasks");
   } else {
     await ctx.reply("⛔ Access denied.");
   }
@@ -2027,6 +2029,7 @@ bot.callbackQuery("gps_force_toggle", async (ctx) => {
 // 🎮 /game_fraze — ON/OFF switch per game (cuts server load / cost)
 // ═══════════════════════════════════════════════════
 const GAME_SWITCHES: { id: string; label: string }[] = [
+  { id: "main-tap", label: "Main Tap" },
   { id: "shoot", label: "AZOX Shoot" },
   { id: "video-ads", label: "AZOX Word" },
   { id: "snake", label: "AZOX Snake" },
@@ -2087,7 +2090,7 @@ bot.command(["game_fraze", "game_freeze"], async (ctx) => {
   await renderGameSwitches(ctx, false);
 });
 
-bot.callbackQuery(/^gf_(shoot|video-ads|snake|tak-bom|question-day|box|global-button|clicker)$/, async (ctx) => {
+bot.callbackQuery(/^gf_(main-tap|shoot|video-ads|snake|tak-bom|question-day|box|global-button|clicker)$/, async (ctx) => {
   if (!await requireAdmin(ctx)) return;
   const id = ctx.match[1];
   const label = GAME_SWITCHES.find((g) => g.id === id)!.label;
@@ -2105,6 +2108,191 @@ bot.callbackQuery(/^gf_(shoot|video-ads|snake|tak-bom|question-day|box|global-bu
   await renderGameSwitches(ctx, true);
   await ctx.answerCallbackQuery(`${label}: ${next ? "ON" : "OFF"}`);
 });
+
+// ═══════════════════════════════════════════════════
+// 🎭 /game_change — choose which face the Gaming page shows
+//   Face 1 = the games page (referral: +4000 for the referrer only)
+//   Face 2 = logo + personal referral link + friend picker
+//            (referrer +5000; friend picked from Telegram → friend +3000, 10 tasks each)
+// ═══════════════════════════════════════════════════
+type Face = 1 | 2;
+
+async function readGamingFace(): Promise<{ face: Face; error?: string }> {
+  const { data, error } = await supabase.rpc("get_gaming_face");
+  if (error) return { face: 1, error: error.message };
+  return { face: Number(data) === 2 ? 2 : 1 };
+}
+
+function faceText(face: Face) {
+  return (
+    "🎭 Gaming page face\n\n" +
+    `Now showing: ${face === 1 ? "Face 1 — Games" : "Face 2 — Referral"}\n` +
+    `Hidden: ${face === 1 ? "Face 2" : "Face 1"}\n\n` +
+    "Face 1 — Games page. Referral pays the referrer 4000 points only.\n" +
+    "Face 2 — AZOX logo + personal referral link. Referrer 5000 points; if the referrer picked the friend from Telegram: friend 3000 points and 10 tasks each.\n\n" +
+    "The change reaches users within about a minute."
+  );
+}
+
+function faceKeyboard(face: Face) {
+  return new InlineKeyboard()
+    .text(`${face === 1 ? "✅ " : ""}Face 1 — Games`, "face_1").row()
+    .text(`${face === 2 ? "✅ " : ""}Face 2 — Referral`, "face_2").row()
+    .text("❌ Close", "cancel");
+}
+
+async function renderFaceMenu(ctx: any, edit: boolean) {
+  const f = await readGamingFace();
+  if (f.error) {
+    const msg = "❌ Error: " + f.error;
+    return edit ? ctx.editMessageText(msg).catch(() => {}) : ctx.reply(msg);
+  }
+  const text = faceText(f.face);
+  const kb = faceKeyboard(f.face);
+  if (edit) {
+    await ctx.editMessageText(text, { reply_markup: kb }).catch(() => {});
+  } else {
+    await ctx.reply(text, { reply_markup: kb });
+  }
+}
+
+bot.command("game_change", async (ctx) => {
+  if (await denyNonAdmin(ctx)) return;
+  ctx.session = {};
+  await renderFaceMenu(ctx, false);
+});
+
+bot.callbackQuery(/^face_(1|2)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const face = Number(ctx.match[1]) as Face;
+  const { error } = await supabase.rpc("set_gaming_face", { p_face: face, p_admin: ADMIN_ID });
+  if (error) {
+    await ctx.answerCallbackQuery("Error: " + error.message.slice(0, 150));
+    return;
+  }
+  await renderFaceMenu(ctx, true);
+  await ctx.answerCallbackQuery(`Face ${face} is now showing`);
+});
+
+// ═══════════════════════════════════════════════════
+// 📖 /story_task — tasks given for Story engagement
+//   Each kind (view / like / comment) can be ON or OFF and pays 1–200 task units.
+//   A user is paid once per story per kind (repeat comments, un-like/re-like never pay again).
+// ═══════════════════════════════════════════════════
+type StKind = "view" | "like" | "comment";
+const ST_KINDS: { id: StKind; label: string }[] = [
+  { id: "view", label: "👁 Views" },
+  { id: "like", label: "❤️ Likes" },
+  { id: "comment", label: "💬 Comments" },
+];
+type StSettings = Record<StKind, { enabled: boolean; units: number }>;
+
+async function readStoryTask(): Promise<{ s?: StSettings; error?: string }> {
+  const { data, error } = await supabase.rpc("get_story_task_settings");
+  if (error || !data) return { error: error?.message ?? "no data" };
+  const d: any = data;
+  const s = {} as StSettings;
+  for (const k of ST_KINDS) {
+    s[k.id] = { enabled: d?.[k.id]?.enabled === true, units: Number(d?.[k.id]?.units) || 1 };
+  }
+  return { s };
+}
+
+function storyTaskText(s: StSettings) {
+  const lines = ST_KINDS.map(
+    (k) => `${k.label}: ${s[k.id].enabled ? "ON ✅" : "OFF 🔴"} — ${s[k.id].units} task(s)`
+  ).join("\n");
+  return (
+    "📖 Story tasks\n\n" +
+    lines + "\n\n" +
+    "• ON/OFF — turn the reward on or off.\n" +
+    "• ✏️ — set how many tasks each user gets (1 to 200).\n\n" +
+    "A user is paid once per story for each kind. Repeating a comment, or un-liking and liking again, never pays twice. " +
+    "Changing the number only affects future payouts."
+  );
+}
+
+function storyTaskKeyboard(s: StSettings) {
+  const kb = new InlineKeyboard();
+  for (const k of ST_KINDS) {
+    kb.text(`${k.label} — ${s[k.id].enabled ? "ON ✅" : "OFF 🔴"}`, `st_toggle_${k.id}`)
+      .text(`✏️ ${s[k.id].units}`, `st_units_${k.id}`)
+      .row();
+  }
+  return kb.text("❌ Close", "cancel");
+}
+
+async function renderStoryTaskMenu(ctx: any, edit: boolean) {
+  const r = await readStoryTask();
+  if (!r.s) {
+    const msg = "❌ Error: " + (r.error ?? "unknown");
+    return edit ? ctx.editMessageText(msg).catch(() => {}) : ctx.reply(msg);
+  }
+  const text = storyTaskText(r.s);
+  const kb = storyTaskKeyboard(r.s);
+  if (edit) {
+    await ctx.editMessageText(text, { reply_markup: kb }).catch(() => {});
+  } else {
+    await ctx.reply(text, { reply_markup: kb });
+  }
+}
+
+bot.command("story_task", async (ctx) => {
+  if (await denyNonAdmin(ctx)) return;
+  ctx.session = {};
+  await renderStoryTaskMenu(ctx, false);
+});
+
+bot.callbackQuery(/^st_toggle_(view|like|comment)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const kind = ctx.match[1] as StKind;
+  const cur = await readStoryTask();
+  if (!cur.s) {
+    await ctx.answerCallbackQuery("Error: " + (cur.error ?? "").slice(0, 150));
+    return;
+  }
+  const next = !cur.s[kind].enabled;
+  const { error } = await supabase.rpc("set_story_task", {
+    p_kind: kind, p_enabled: next, p_units: null, p_admin: ADMIN_ID,
+  });
+  if (error) {
+    await ctx.answerCallbackQuery("Error: " + error.message.slice(0, 150));
+    return;
+  }
+  await renderStoryTaskMenu(ctx, true);
+  await ctx.answerCallbackQuery(`${kind}: ${next ? "ON" : "OFF"}`);
+});
+
+bot.callbackQuery(/^st_units_(view|like|comment)$/, async (ctx) => {
+  if (!await requireAdmin(ctx)) return;
+  const kind = ctx.match[1] as StKind;
+  const label = ST_KINDS.find((k) => k.id === kind)!.label;
+  ctx.session = { step: "st_units", stKind: kind };
+  await ctx.editMessageText(
+    `${label}\n\nSend how many tasks each user gets — a whole number from 1 to 200:`,
+    { reply_markup: cancelOnlyKeyboard() }
+  ).catch(() => {});
+  await ctx.answerCallbackQuery();
+});
+
+async function handleStoryTaskUnits(ctx: any, s: SessionData, text: string) {
+  const kind = s.stKind;
+  if (!kind) { ctx.session = {}; return; }
+  if (!/^\d{1,3}$/.test(text)) {
+    return ctx.reply("❌ Send a whole number from 1 to 200:", { reply_markup: cancelOnlyKeyboard() });
+  }
+  const n = parseInt(text, 10);
+  if (n < 1 || n > 200) {
+    return ctx.reply("❌ The number must be from 1 to 200:", { reply_markup: cancelOnlyKeyboard() });
+  }
+  const { error } = await supabase.rpc("set_story_task", {
+    p_kind: kind, p_enabled: null, p_units: n, p_admin: ADMIN_ID,
+  });
+  ctx.session = {};
+  if (error) return ctx.reply("❌ Error: " + error.message);
+  await ctx.reply(`✅ ${ST_KINDS.find((k) => k.id === kind)!.label}: ${n} task(s) per user.`);
+  await renderStoryTaskMenu(ctx, false);
+}
 
 // ─── TEXT HANDLER (all steps) ───────────────────────
 bot.on("message:text", async (ctx) => {
@@ -2147,6 +2335,9 @@ bot.on("message:text", async (ctx) => {
 
   // BAN
   if (s.step === "ban_to") return handleBanText(ctx, s, text);
+
+  // STORY TASKS: number of tasks per kind
+  if (s.step === "st_units") return handleStoryTaskUnits(ctx, s, text);
 
   // CHAT MESSAGES (the bot writes into users' chats)
   if (s.step === "cm_content") return handleChatTextContent(ctx, s);
